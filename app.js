@@ -416,6 +416,7 @@ function tick() {
     $('#tp-pos').textContent = fmt(pos);
     if (!seeking) $('#tp-seek').value = dur ? Math.round((pos / dur) * 1000) : 0;
     liveChips(pos);
+    lyricsFit();
     lyricsUpdate(pos);
     if (!$('#mixer').hidden) meters();
     if ((engineIsPlaying() ? 1 : 0) !== tick.wasPlaying) { tick.wasPlaying = engineIsPlaying() ? 1 : 0; renderTransport(); }
@@ -492,7 +493,7 @@ function meters() {
 
 // ------------------------------------------------------------------ lyrics
 const LY_SIZES = ['S', 'M', 'L', 'XL'];
-let lyLines = [], lySections = [], lyCurrent = -1, lyCurrentSec = -1, lyricsJumpScroll = false, lyHoldUntil = 0;
+let lyLines = [], lySections = [], lyCurrent = -1, lyCurrentSec = -1, lyricsJumpScroll = false, lyTouchedAt = 0;
 
 function lyricsTrackChoice(song) {
   const tracks = song?.lyrics?.tracks || [];
@@ -569,20 +570,50 @@ function lyricsUpdate(pos) {
   lyricsJumpScroll = false;
 }
 let lyUpdateNext = -1, lyScrollAnim = null;
+// Puts a line about a third of the way down the lyrics box (same as TSP Work).
+// Measured with getBoundingClientRect so it is right whatever the page layout,
+// zoom or device; only the lyrics box scrolls, never the page.
 function scrollLyricsTo(el) {
-  if (Date.now() < lyHoldUntil && !lyricsJumpScroll) return;
+  const instant = lyricsJumpScroll;
+  if (!instant && Date.now() - lyTouchedAt < 4000) return;   // the reader scrolled by hand: wait 4 s
   const sc = $('#lyrics-scroll');
-  const target = el.offsetTop - sc.clientHeight * 0.35;
-  const from = sc.scrollTop, dist = target - from;
-  if (Math.abs(dist) < 2) return;
+  if (!sc || !sc.clientHeight) return;
+  const top = el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop - sc.clientHeight * 0.35;
+  const goal = Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, Math.round(top)));
+  if (Math.abs(sc.scrollTop - goal) < 2) return;
   cancelAnimationFrame(lyScrollAnim);
-  const t0 = performance.now(), dur = lyricsJumpScroll ? 1 : 520;
+  if (instant) { sc.scrollTop = goal; return; }
+  // iPhone/iPad: Safari's own smooth scrolling is the reliable way to glide there.
+  if (PHONE && 'scrollBehavior' in document.documentElement.style) { sc.scrollTo({ top: goal, behavior: 'smooth' }); return; }
+  const from = sc.scrollTop, dist = goal - from;
+  const dur = Math.min(900, 420 + Math.abs(dist) * 0.6);
+  const t0 = performance.now();
+  const ease = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
   const step = (now) => {
-    const k = Math.min(1, (now - t0) / dur); const e = 1 - (1 - k) ** 3;
-    sc.scrollTop = from + dist * e;
+    if (Date.now() - lyTouchedAt < 300) return;   // the reader took over
+    const k = Math.min(1, (now - t0) / dur);
+    sc.scrollTop = from + dist * ease(k);
     if (k < 1) lyScrollAnim = requestAnimationFrame(step);
   };
   lyScrollAnim = requestAnimationFrame(step);
+}
+// The lyrics box always ends just above the playback bar, and the space above
+// the first line / below the last is sized to the box (not the screen), so the
+// current line can sit a third of the way down on the page and in full screen.
+function lyricsFit() {
+  const sc = $('#lyrics-scroll'), box = $('#lyrics');
+  if (!sc || !box || $('#view-practice').hidden) return;
+  let h;
+  if (document.body.classList.contains('fs')) h = window.innerHeight;
+  else {
+    const bar = $('#transport');
+    const barTop = bar && getComputedStyle(bar).display !== 'none' ? bar.getBoundingClientRect().top : window.innerHeight;
+    h = Math.round(Math.max(260, barTop - 12 - sc.getBoundingClientRect().top));
+  }
+  if (Math.abs(sc.offsetHeight - h) > 2) sc.style.height = `${h}px`;
+  const padTop = `${Math.round(h * 0.18)}px`, padBottom = `${Math.round(h * 0.62)}px`;
+  if (box.style.paddingTop !== padTop) box.style.paddingTop = padTop;
+  if (box.style.paddingBottom !== padBottom) box.style.paddingBottom = padBottom;
 }
 function setLySize(sz) {
   LY_SIZES.forEach((s) => document.body.classList.remove(`ly-${s}`));
@@ -597,7 +628,7 @@ function toggleFs(on = !document.body.classList.contains('fs')) {
   if (on) { try { document.documentElement.requestFullscreen?.(); } catch { /* iPhone */ } fsPoke(); }
   else { try { if (document.fullscreenElement) document.exitFullscreen(); } catch { /* fine */ } }
   $('#btn-fs').classList.toggle('on', on);
-  lyricsJumpScroll = true;
+  lyricsFit(); lyricsJumpScroll = true;
 }
 function fsPoke() {
   document.body.classList.remove('fs-quiet');
@@ -788,7 +819,11 @@ function wireStatic() {
     else if (document.body.classList.contains('fs')) document.body.classList.toggle('fs-quiet');
   });
   const sc = $('#lyrics-scroll');
-  ['wheel', 'touchmove'].forEach((ev) => sc.addEventListener(ev, () => { lyHoldUntil = Date.now() + 4000; cancelAnimationFrame(lyScrollAnim); }, { passive: true }));
+  // A hand scroll (touch, wheel, keys, scrollbar) pauses the autoscroll for 4 s.
+  ['touchstart', 'wheel', 'keydown', 'pointerdown'].forEach((ev) => sc.addEventListener(ev, () => { lyTouchedAt = Date.now(); cancelAnimationFrame(lyScrollAnim); }, { passive: true }));
+  window.addEventListener('resize', () => { lyricsFit(); lyricsJumpScroll = true; });
+  window.addEventListener('scroll', lyricsFit, { passive: true });
+  if (window.ResizeObserver) new ResizeObserver(() => { lyricsFit(); }).observe($('#transport'));
   $('#btn-size').addEventListener('click', sizePicker);
   $('#btn-fs').addEventListener('click', () => toggleFs());
   $('#btn-room').addEventListener('click', roomDialog);
