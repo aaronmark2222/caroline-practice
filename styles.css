@@ -74,7 +74,7 @@ main { padding: 14px 16px calc(var(--tp-h) + 30px + env(safe-area-inset-bottom))
 .ly-chip i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .ly-chip.active { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.35); }
 .ly-tools { display: flex; gap: 6px; flex: none; }
-.lyrics-scroll { position: relative; height: calc(100vh - 215px - var(--tp-h)); min-height: 260px; overflow-y: auto; padding: 0 22px; scroll-behavior: auto; overscroll-behavior: contain; }
+.lyrics-scroll { position: relative; height: calc(100vh - 215px - var(--tp-h)); min-height: 260px; overflow-y: auto; padding: 0 22px; scroll-behavior: auto; overscroll-behavior-y: auto; }
 .lyrics { font-size: var(--ly-size); padding: 18vh 0 60vh; }
 .ly-title { font-size: .9em; font-weight: 800; letter-spacing: .06em; padding: .4em .7em; border: 2px solid rgba(255,255,255,.75); display: inline-block; border-radius: 6px; margin-bottom: .4em; }
 .ly-key { color: var(--muted); font-size: .6em; margin-bottom: .6em; }
@@ -196,3 +196,4 @@ body.view-sync main { padding-bottom: 40px; }
 
 .offline-banner { background: rgba(255,207,77,.14); border-bottom: 1px solid rgba(255,207,77,.35); color: var(--warn); font-size: 13px; text-align: center; padding: 6px 12px; }
 #offline-card { margin-top: 14px; }
+body.fs .lyrics-scroll { overscroll-behavior: contain; }

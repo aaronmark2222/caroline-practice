@@ -823,9 +823,12 @@ function lyricsFit() {
   let h;
   if (document.body.classList.contains('fs')) h = window.innerHeight;
   else {
+    // Sized from where the box sits with the page scrolled to the top (not where it is now),
+    // so the box doesn't grow while the page scrolls and the Offline audio card stays reachable.
     const bar = $('#transport');
-    const barTop = bar && getComputedStyle(bar).display !== 'none' ? bar.getBoundingClientRect().top : window.innerHeight;
-    h = Math.round(Math.max(260, barTop - 12 - sc.getBoundingClientRect().top));
+    const barH = bar && getComputedStyle(bar).display !== 'none' ? bar.getBoundingClientRect().height : 0;
+    const topInPage = sc.getBoundingClientRect().top + window.scrollY;
+    h = Math.round(Math.max(260, window.innerHeight - barH - 12 - topInPage));
   }
   if (Math.abs(sc.offsetHeight - h) > 2) sc.style.height = `${h}px`;
   const padTop = `${Math.round(h * 0.18)}px`, padBottom = `${Math.round(h * 0.62)}px`;
@@ -1039,7 +1042,6 @@ function wireStatic() {
   // A hand scroll (touch, wheel, keys, scrollbar) pauses the autoscroll for 4 s.
   ['touchstart', 'wheel', 'keydown', 'pointerdown'].forEach((ev) => sc.addEventListener(ev, () => { lyTouchedAt = Date.now(); cancelAnimationFrame(lyScrollAnim); }, { passive: true }));
   window.addEventListener('resize', () => { lyricsFit(); lyricsJumpScroll = true; });
-  window.addEventListener('scroll', lyricsFit, { passive: true });
   if (window.ResizeObserver) new ResizeObserver(() => { lyricsFit(); }).observe($('#transport'));
   $('#btn-size').addEventListener('click', sizePicker);
   $('#btn-fs').addEventListener('click', () => toggleFs());
