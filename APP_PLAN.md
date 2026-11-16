@@ -1,6 +1,6 @@
 # Caroline Practice — App Plan (master document)
 
-_Last reconciled: **2026-11-16** · cache markers `app.js?v=20261116-1`, `styles.css?v=20261116-1`, `als.js?v=20261116-1` · Supabase migration `caroline_practice_init` · Edge Function `caroline-audio` **v1** · published from branch `gh-pages`._
+_Last reconciled: **2026-11-16** · cache markers `app.js?v=20261116-2`, `styles.css?v=20261116-2`, `als.js?v=20261116-1` · Supabase migration `caroline_practice_init` · Edge Function `caroline-audio` **v2** · Ableton control surface **CarolineSync 1.0** · published from branch `gh-pages`._
 
 The single source of truth for resuming work on **Caroline Practice**, a side project of the TSP Band App (TSP Work). Read sections 0–4 before changing anything. Live code and databases win over this file; this file wins over memory.
 
@@ -42,7 +42,11 @@ Supabase hzvfrvjuqvmkeqbrgmqu (shared with TSP Work) ◄── Auth + PostgREST 
    Edge Fn caroline-audio (R2 keys = project secrets) ──presigned URLs──►         │◄── audio GET/PUT ── Cloudflare R2 bucket tsp-practice, prefix caroline/
    Realtime broadcast channels cp-room-<CODE> (group practice)                     │
 Ableton set: /Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als ── read in the browser on the Sync page (als.js)
+Sync page (Aaron's Mac) ──fetch https://127.0.0.1:47721──► CarolineSync control surface inside Live
+   └── renders each track through Live's Export dialog, afconvert → AAC .m4a, curl PUT to presigned R2 links
 ```
+
+**CarolineSync is NOT TSPWork.** It is a separate control surface (own folder, own ports 47720/47721, own log), kept in this repo under `tools/ableton-remote-script/CarolineSync/`. The band's TSPWork and the TSP Band App repo must never be edited for this project (Aaron, 16 Nov 2026).
 
 - **Source of truth:** the `.als` for songs (locators), lyrics (`+LYRICS` tracks), sections (SECTIONS), tempo, keys, track colours and the list of exportable tracks; R2 for which audio exists (no audio table; `caroline-audio` lists the prefix); Supabase for users and the saved copy of the set data.
 - **Isolation from TSP Work:** Caroline has no `members` row, so every TSP table returns nothing for her (checked). TSP Work's `practice-audio` only lists `songs/`, so the `caroline/` prefix never shows there. This app stores its sign-in under `localStorage['cp-auth-v1']` because both apps live on the origin `aaronmark2222.github.io`.
@@ -56,7 +60,8 @@ Ableton set: /Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als ── 
 | Live site | https://aaronmark2222.github.io/caroline-practice/ (Pages source: branch `gh-pages`, root) |
 | Ableton project | `/Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als` (Aaron saves it himself; the app never writes to it) |
 | Supabase | project `hzvfrvjuqvmkeqbrgmqu`; publishable key in `app.js` (public by design) |
-| Edge Function | `caroline-audio` (verify_jwt on): `list`, `urls {song}`, `upload {song, element, ext}` (admin), `finalize` (admin; removes other formats), `delete` (admin) |
+| Edge Function | `caroline-audio` (verify_jwt on): `list`, `urls {song}`, `upload {song, element, ext}` (admin), `finalize` (admin; removes other formats), `delete` (admin), `upload_batch {songs, elements}` (admin; 24 h PUT/DEL links for CarolineSync) |
+| CarolineSync | `~/Music/Ableton/User Library/Remote Scripts/CarolineSync/` (`__init__.py`, `carolinesync.py`, `exporter.py` = a copy of TSPWork's exporter plus `CarolineExportJob`; `carolinesync-localhost.crt/.key` = copies of TSPWork's trusted 127.0.0.1 certificate, never committed). Selected in an empty Control Surface slot in Live (Input/Output None) next to TSPWork. HTTP 127.0.0.1:47720, HTTPS :47721; origins GitHub Pages + localhost:8000; every POST needs the admin's Supabase token (checked with `rpc/cp_is_admin`); exports only while `/Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als` is the open set and Live is stopped; uploads only to `caroline/`. Endpoints: GET `/status`; POST `/export`, `/export/state`, `/export/cancel` (`{after_song:true}`) |
 | R2 | bucket `tsp-practice`, keys `caroline/<song-slug>/<element-slug>.<mp3|m4a|wav>`; CORS already allows the GitHub Pages origin |
 | Usernames | `<username>` → `<username>@example.com` in Supabase Auth (no real email; no public sign-up) |
 
@@ -88,6 +93,7 @@ Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated onl
   - Lyrics: AbleSet syntax — `[X]` chord box, `[Key:] [C]` key line, `\` line break; a line sits under the section holding most of it; current line enlarges; eased autoscroll (paused 4 s after a manual scroll); click a line/section to seek. Default track: Lyrics (choice remembered per device).
   - Keyboard: Space play/pause, F full screen, ←/→ ±5 s. Lock screen controls via Media Session. Screen kept awake while playing or following.
 - **Group practice:** `Make a room` → 4-character code; host broadcasts `{song,pos,at,playing,duration}` every 500 ms on `cp-room-<CODE>`; followers measure the clock offset by ping/pong (shortest round trip wins), show `synced ±N ms`, hold no audio, and send commands (play/pause/stop/seek/song) the host applies. Host leaving ends the room.
+- **Ableton Sync (admin) — Export from Ableton:** the same workflow as TSP Work's export: tick songs (Select all / Clear; uploaded songs in green), export folder (default `~/Desktop/CAROLINE/Caroline Exports`), Upload checkbox, Start → `upload_batch` links → CarolineSync `/export`; progress polled every 3 s; Stop after this song / Cancel; songs that exported fine are unticked; the audio list refreshes at the end. Per song it renders every STEMS/CPC/PARTS track that has clips in the song on its own (soloed), plus a **Mixdown = those tracks that are not muted in the set** (so the Mixdown is what Aaron hears with his current mutes). The song's locator must still be at its saved position, or the song is refused (read the set again). Files are named `<Song> - <Track>.mp3` in a folder per song; uploads are AAC 128 `.m4a`; an older `.mp3` of the same track is deleted; tracks a song no longer has are removed. Live's Export dialog must be set once to Rendered Track **Main**, MP3 on (as for TSPWork).
 - **Ableton Sync (admin):** Read set (.als parsed in the browser: gunzip + DOMParser) → preview → Save (upserts songs, hides songs no longer present, saves elements). Practice audio grid per song with delete. Upload exports: drop files/folder; song matched by name in the file name, track by the trailing track name (`Main`/`Master`/`Mixdown` → Mixdown); dropdowns to correct; WAV/AIFF converted to MP3 192 kbps; silent files skipped; length checked against the set (±1.5 s); PUT to presigned R2 URL with progress, then `finalize`.
 
 ## 7. The Ableton set (as read 16 Nov 2026)
@@ -107,18 +113,22 @@ Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated onl
 
 ## 9. Testing habits
 
+`python3 -m unittest discover -s tools/ableton-remote-script/tests` (CarolineSync link guard, open-set guard, export plan with stubbed Live).
+
 Headless Chrome (Playwright) with a fake supabase-js module (routes esm.sh) and generated tone MP3s covers playback, mixer, lyrics, full screen, the Sync page and two-page rooms (BroadcastChannel stand-in). Note: python's `http.server` has no Range support, so Mixdown seeking fails there but not on R2.
 
 ## 10. Known issues / not yet checked
 
 - Real sign-in, real Supabase reads and the R2 upload have not yet been run end to end by a person (the Claude workspace cannot reach Supabase).
-- No practice audio uploaded yet (Aaron exports and uploads).
+- No practice audio uploaded yet. First real CarolineSync export not yet run; Live's Export dialog settings (Main, MP3) are assumed to carry over from the band set.
 - iPhone memory with many long multitrack tracks is untested; phones decode at 24 kHz and only audible tracks.
 
 ## 11. Decision log
 
+- **2026-11-16 (evening):** Aaron wants the TSP-style exporter (select songs, export and upload from the Sync page). First attempt put a Caroline profile inside TSPWork 1.34; Aaron said never to edit the band app, so it was reverted the same minute (band repo commit `54f3b58` restores TSPWork 1.33 byte-for-byte; the installed TSPWork files were restored to their originals). Built instead as the separate **CarolineSync** control surface in this repo. Mixdown = the exported tracks that are not muted in the set.
 - **2026-11-16:** Built as a separate public repo with Pages from `gh-pages`; shares TSP's Supabase project (so the existing R2 secrets work) with `cp_` tables and its own Edge Function; R2 under `caroline/` in the same bucket; songs from locators only; Aaron admin with his TSP login, Caroline as username `caroline`; Mac folder is a clone with a git-ignored `private/`.
 
 ## 12. Changelog of this plan
 
 - **2026-11-16:** Created.
+- **2026-11-16:** Added CarolineSync (Export from Ableton) and `upload_batch`.

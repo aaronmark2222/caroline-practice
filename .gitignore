@@ -1,4 +1,9 @@
-tools/node_modules/
-tools/
-private/
+*.crt
+*.key
 .DS_Store
+__pycache__/
+private/
+requests.log*
+tools/*.mjs
+tools/node_modules/
+tools/package*.json

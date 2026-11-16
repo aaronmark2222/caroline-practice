@@ -890,8 +890,10 @@ function renderSync() {
       }).join('')}
     </section>
 
+    <section class="card" id="exp-card"></section>
+
     <section class="card">
-      <h2>Upload exports</h2>
+      <h2>Upload exports by hand</h2>
       <details class="help"><summary>How to export from Ableton</summary><ol>
         <li>In Ableton, click the song's locator, then shift-click the next locator so the song's time range is selected (or set the loop brace over the song).</li>
         <li>File › Export Audio/Video. <b>Rendered Track: All Individual Tracks</b> (gives each track) — and once with <b>Main</b> for the Mixdown.</li>
@@ -912,6 +914,7 @@ function renderSync() {
       <p class="muted small">Caroline signs in with username <b>caroline</b>. She can use the same sign-in on any number of devices, and change her password from the menu at the top right.</p></section>
   </div>`;
   renderUploadTable();
+  renderExportCard(); bridgeWatch();
   db.from('cp_users').select('name,role,created_at').order('created_at').then(({ data }) => {
     const u = $('#users'); if (u) u.innerHTML = (data || []).map((m) => `<div>${esc(m.name)} <span class="muted small">· ${esc(m.role)}</span></div>`).join('');
   });
@@ -930,6 +933,8 @@ function wireSync() {
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); addFiles(e.dataTransfer.files); });
+  if (v._wired) return;   // the delegated listeners below are added once
+  v._wired = true;
   v.addEventListener('click', async (e) => {
     const del = e.target.closest('[data-del]');
     if (del) {
@@ -938,10 +943,22 @@ function wireSync() {
       try { await fn({ action: 'delete', song, element: el }); toast('Deleted.'); await refreshAudioList(); renderSync(); } catch (err) { toast(`Delete failed: ${err.message}`); }
     }
     if (e.target.id === 'als-save') saveAls();
+    if (e.target.id === 'exp-all') { exp.selected = new Set(state.songs.map((x) => x.slug)); lset('cp-exp-sel', [...exp.selected]); renderExportCard(); }
+    if (e.target.id === 'exp-none') { exp.selected = new Set(); lset('cp-exp-sel', []); renderExportCard(); }
+    if (e.target.id === 'exp-start') exportStart();
+    if (e.target.id === 'exp-after') bridgeCall('/export/cancel', { after_song: true }).then(exportPoll);
+    if (e.target.id === 'exp-cancel') { if (confirm('Cancel the export now? Live is put back as it was.')) bridgeCall('/export/cancel', {}).then(exportPoll); }
+    if (e.target.id === 'exp-retry') bridgeProbe(true);
     if (e.target.id === 'up-go') uploadAll();
     if (e.target.id === 'up-clear') { sync.rows = []; renderUploadTable(); }
   });
   v.addEventListener('change', (e) => {
+    if (e.target.matches('[data-exp-song]')) {
+      e.target.checked ? exp.selected.add(e.target.dataset.expSong) : exp.selected.delete(e.target.dataset.expSong);
+      lset('cp-exp-sel', [...exp.selected]); renderExportCard(); return;
+    }
+    if (e.target.id === 'exp-folder') { exp.folder = e.target.value.trim(); lset('cp-exp-folder', exp.folder); return; }
+    if (e.target.id === 'exp-upload') { exp.upload = e.target.checked; return; }
     const sel = e.target.closest('select[data-row]'); if (!sel) return;
     const r = sync.rows[+sel.dataset.row]; r[sel.dataset.field] = sel.value; r.status = 'ready'; markDuplicates(); renderUploadTable();
   });
@@ -980,6 +997,122 @@ async function saveAls() {
   if (state.song) { state.song = state.songs.find((s) => s.slug === state.song.slug) || null; renderLyrics(); }
   toast('Saved. Every device sees the new lyrics next time it opens the song.');
   renderSync();
+}
+
+// ---- export from Ableton (CarolineSync control surface on Aaron's Mac)
+// CarolineSync is a separate Ableton control surface (tools/ableton-remote-script/CarolineSync),
+// never the band's TSPWork. It listens on 127.0.0.1 only and checks the admin's token itself.
+const BRIDGE_URLS = ['https://127.0.0.1:47721', 'http://127.0.0.1:47720'];
+const exp = { base: null, status: null, job: null, timer: 0, poll: 0, selected: new Set(lget('cp-exp-sel', [])), folder: lget('cp-exp-folder', '~/Desktop/CAROLINE/Caroline Exports'), upload: true, starting: false, error: '' };
+const EXP_ERRORS = {
+  caroline_set_not_open: 'Open Caroline.als in Ableton first (CarolineSync only exports that set).',
+  live_playing: 'Stop playback in Ableton first.', busy: 'CarolineSync is busy — try again in a moment.',
+  export_folder_missing: 'That export folder’s parent folder does not exist on this Mac.', bad_export_folder: 'The export folder must be in your home folder or on an external drive.',
+  not_admin: 'Only the admin can export.', auth_required: 'Sign in again, then retry.', auth_unreachable: 'CarolineSync could not check your sign-in (is this Mac online?).',
+};
+async function bridgeFetch(base, path, body, ms) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms || (body ? 15000 : 1500));
+  try {
+    const r = await fetch(base + path, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'text/plain' } : undefined, body: body ? JSON.stringify(body) : undefined, cache: 'no-store', signal: ctl.signal });
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+async function bridgeProbe(render) {
+  let status = null;
+  for (const base of exp.base ? [exp.base, ...BRIDGE_URLS.filter((b) => b !== exp.base)] : BRIDGE_URLS) {
+    try { const r = await bridgeFetch(base, '/status'); if (r?.app === 'carolinesync') { exp.base = base; status = r; break; } } catch { /* not there */ }
+  }
+  exp.status = status;
+  if (status?.exporting) { exp.job = status.exporting; if (!exp.poll) exportPoll(); }
+  if (render) renderExportCard();
+  return status;
+}
+async function bridgeCall(path, body) {
+  const token = async (refresh) => { try { const { data } = refresh ? await db.auth.refreshSession() : await db.auth.getSession(); return data?.session?.access_token; } catch { return null; } };
+  if (!exp.base) await bridgeProbe();
+  if (!exp.base) return { ok: false, error: 'not_running' };
+  let r = await bridgeFetch(exp.base, path, { ...body, _auth: await token(false) }, 30000);
+  if (r && ['auth_required', 'not_admin'].includes(r.error)) r = await bridgeFetch(exp.base, path, { ...body, _auth: await token(true) }, 30000);
+  return r;
+}
+function bridgeWatch() {
+  clearInterval(exp.timer);
+  bridgeProbe(true);
+  exp.timer = setInterval(() => { if (state.view !== 'sync') { clearInterval(exp.timer); return; } if (!exp.poll) bridgeProbe(true); }, 5000);
+}
+async function exportStart() {
+  const songs = state.songs.filter((s) => exp.selected.has(s.slug));
+  if (!songs.length) { toast('Tick at least one song.'); return; }
+  exp.starting = true; exp.error = ''; renderExportCard();
+  try {
+    const elements = state.elements.map((e) => ({ slug: e.slug, track: e.name, group: e.group, label: e.label }));
+    let uploads = {};
+    if (exp.upload) uploads = (await fn({ action: 'upload_batch', songs: songs.map((s) => s.slug), elements: elements.map((e) => e.slug) })).urls;
+    const r = await bridgeCall('/export', {
+      export_root: exp.folder || '~/Desktop/CAROLINE/Caroline Exports', uploads, elements,
+      songs: songs.map((s) => ({ song_id: s.slug, song_name: s.name, start_beat: s.start_beat, end_beat: s.end_beat, locator: s.name })),
+    });
+    if (!r?.ok) throw new Error(EXP_ERRORS[r?.error] || r?.error || 'CarolineSync did not answer');
+    exp.job = r.job; exportPoll();
+  } catch (e) { exp.error = e.message; }
+  exp.starting = false; renderExportCard();
+}
+async function exportPoll() {
+  clearTimeout(exp.poll); exp.poll = 0;
+  let r; try { r = await bridgeCall('/export/state', {}); } catch { r = null; }
+  if (r?.job) exp.job = r.job;
+  renderExportCard();
+  const st = exp.job?.state;
+  if (['starting', 'running', 'uploading'].includes(st)) exp.poll = setTimeout(exportPoll, 3000);
+  else if (st && exp.job.finished_at && exp.lastFinished !== exp.job.finished_at) {
+    exp.lastFinished = exp.job.finished_at;
+    const done = (exp.job.results || []).filter((x) => x.state === 'done').map((x) => x.song_id);
+    done.forEach((sl) => exp.selected.delete(sl)); lset('cp-exp-sel', [...exp.selected]);
+    await refreshAudioList(); renderSongChips(); pt.filesFor = null;
+    toast(st === 'done' ? 'Export finished — the new audio is live for everyone.' : `Export ended: ${exp.job.error || st}`);
+    renderSync();
+  }
+}
+function renderExportCard() {
+  const box = $('#exp-card'); if (!box) return;
+  const s = exp.status, job = exp.job;
+  const running = ['starting', 'running', 'uploading'].includes(job?.state);
+  let head;
+  if (!s && !running) head = `<p class="warnc">CarolineSync isn't answering on this Mac.</p>
+    <details class="help" open><summary>How to switch it on</summary><ol>
+    <li>Open Ableton Live with <b>Caroline.als</b>.</li>
+    <li>Live › Settings › <b>Link, Tempo &amp; MIDI</b> › an empty <b>Control Surface</b> slot › choose <b>CarolineSync</b> (Input and Output: None). Leave TSPWork where it is.</li>
+    <li>Use this page in a browser on the same Mac.</li></ol></details><button class="btn small" id="exp-retry">Check again</button>`;
+  else if (s && !s.caroline_open && !running) head = `<p class="warnc">CarolineSync ${esc(s.version)} is connected, but the open set is not Caroline.als. Open <b>Caroline.als</b> in Ableton.</p><button class="btn small" id="exp-retry">Check again</button>`;
+  else head = `<p class="ok small">CarolineSync ${esc(s?.version || '')} connected · Caroline.als is open.</p>`;
+  const have = (slug) => !!state.audio[slug]?.mixdown;
+  const list = state.songs.map((x) => `<label class="row" style="gap:8px;padding:4px 0"><input type="checkbox" data-exp-song="${esc(x.slug)}" ${exp.selected.has(x.slug) ? 'checked' : ''} ${running ? 'disabled' : ''}>
+    <span class="${have(x.slug) ? 'ok' : ''}">${esc(x.name)}</span><span class="muted small">${fmt(x.duration_seconds)}${have(x.slug) ? ' · uploaded' : ''}</span></label>`).join('');
+  let prog = '';
+  if (job) {
+    const q = job.queue || []; const idx = job.song_index || 0;
+    const name = state.songs.find((x) => x.slug === job.song_id)?.name || job.song_id;
+    const label = (sl) => state.elements.find((e) => e.slug === sl)?.label || sl;
+    const doneSongs = (job.results || []).filter((r) => r.state === 'done').length;
+    const pct = q.length ? Math.round(((doneSongs + (job.total ? (job.done || []).length / job.total : 0)) / q.length) * 100) : 0;
+    prog = `<div style="margin-top:12px"><div class="bar"><i style="width:${running ? Math.min(99, pct) : 100}%"></i></div>
+      <p class="small">${running ? `${job.state === 'uploading' ? 'Finishing uploads' : `Exporting <b>${esc(name)}</b> (${idx + 1} of ${q.length})${job.current ? ` · ${esc(label(job.current))}` : ''}`}` : `Last export: <b>${esc(job.state)}</b>`}
+      · ${job.uploaded || 0} uploaded${job.upload_pending ? `, ${job.upload_pending} waiting` : ''}${job.stop_after_song ? ' · will stop after this song' : ''}</p>
+      ${(job.results || []).map((r) => `<div class="small">${r.state === 'done' ? '<span class="ok">✓</span>' : r.state === 'error' ? '<span class="badc">✕</span>' : '·'} ${esc(state.songs.find((x) => x.slug === r.song_id)?.name || r.song_id)} — ${esc(r.state)}${r.files ? `, ${r.files} files` : ''}${r.error ? ` <span class="badc">${esc(r.error)}</span>` : ''}</div>`).join('')}
+      ${(job.upload_failed || []).map((f) => `<div class="small badc">Upload failed: ${esc(f.song_id)} ${esc(label(f.label))} — ${esc(f.error)}</div>`).join('')}
+      ${job.error && !running ? `<p class="badc small">${esc(job.error)}</p>` : ''}</div>`;
+  }
+  box.innerHTML = `<div class="row"><h2 style="margin:0">Export from Ableton</h2></div>
+    <p class="muted small">Like TSP Work's overnight export: tick songs, press Start, and leave Ableton alone. Each track (stems, click, prompts, parts) is rendered on its own, plus a Mixdown of the tracks that are switched on in the set, then uploaded for everyone.</p>
+    ${head}
+    <div class="row" style="margin:6px 0"><button class="btn small" id="exp-all" ${running ? 'disabled' : ''}>Select all</button><button class="btn small" id="exp-none" ${running ? 'disabled' : ''}>Clear</button></div>
+    ${list}
+    <div class="row" style="margin-top:10px"><label class="small" style="flex:1;min-width:240px">Export folder on this Mac<input class="field" id="exp-folder" value="${esc(exp.folder)}" style="width:100%;margin-top:4px" ${running ? 'disabled' : ''}></label>
+      <label class="small"><input type="checkbox" id="exp-upload" ${exp.upload ? 'checked' : ''} ${running ? 'disabled' : ''}> Upload to the app</label></div>
+    <div class="row" style="margin-top:10px"><span class="spacer"></span>
+      ${running ? `<button class="btn" id="exp-after">${job.stop_after_song ? 'Keep going' : 'Stop after this song'}</button><button class="btn danger" id="exp-cancel">Cancel</button>`
+      : `<button class="btn primary" id="exp-start" ${!s?.caroline_open || exp.starting || !exp.selected.size ? 'disabled' : ''}>${exp.starting ? 'Starting…' : `Start export (${exp.selected.size} song${exp.selected.size === 1 ? '' : 's'})`}</button>`}</div>
+    ${exp.error ? `<p class="badc small">${esc(exp.error)}</p>` : ''}${prog}`;
 }
 
 // ---- upload exports

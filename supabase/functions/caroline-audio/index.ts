@@ -6,6 +6,8 @@
 //   { action: 'upload', song, element, ext }             -> signed PUT link (admin)
 //   { action: 'finalize', song, element, ext }           -> after an upload, removes other formats of that track (admin)
 //   { action: 'delete', song, element }                  -> removes a file (admin)
+//   { action: 'upload_batch', songs, elements }          -> 24 h PUT/DELETE links per song and track for the
+//                                                           CarolineSync exporter in Ableton (admin)
 // R2 keys come from this project's Edge Function secrets; the browser never sees them.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
@@ -153,6 +155,27 @@ Deno.serve(async (req) => {
         if (!res.ok && res.status !== 404) throw new Error(`r2_delete_${res.status}`);
       }
       return reply(200, { ok: true });
+    }
+
+    if (body.action === 'upload_batch') {
+      if (!(await admin())) return reply(403, { ok: false, error: 'admin_only' });
+      const songs = (Array.isArray(body.songs) ? body.songs : []).map(String).filter((x: string) => SLUG_RE.test(x)).slice(0, 50);
+      const els = (Array.isArray(body.elements) ? body.elements : []).map(String).filter((x: string) => SLUG_RE.test(x)).slice(0, 40);
+      // The exporter uploads AAC (.m4a): put = the new file, del = its .m4a (for tracks a
+      // song no longer has), del_old = an older .mp3 of the same track (no duplicates).
+      const urls: Record<string, Record<string, { put: string; del: string; del_old: string }>> = {};
+      for (const song of songs) {
+        urls[song] = {};
+        for (const el of els) {
+          const base = `${PREFIX}${song}/${el}`;
+          urls[song][el] = {
+            put: await presign('PUT', `${base}.m4a`, 86400),
+            del: await presign('DELETE', `${base}.m4a`, 86400),
+            del_old: await presign('DELETE', `${base}.mp3`, 86400),
+          };
+        }
+      }
+      return reply(200, { ok: true, urls });
     }
 
     if (body.action === 'delete') {
