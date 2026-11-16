@@ -12,7 +12,7 @@
     <link rel="apple-touch-icon" href="apple-touch-icon.png?v=1">
     <link rel="icon" href="apple-touch-icon.png?v=1">
     <title>Caroline Practice</title>
-    <link rel="stylesheet" href="styles.css?v=20261116-3">
+    <link rel="stylesheet" href="styles.css?v=20261116-4">
   </head>
   <body>
     <div id="boot" class="boot">Opening…</div>
@@ -49,6 +49,7 @@
         </div>
       </header>
 
+      <div id="offline-banner" class="offline-banner" hidden>No connection — you can still practise with the audio saved on this device.</div>
       <main>
         <section id="view-practice" class="view">
           <div class="songs-row" id="song-chips"></div>
@@ -65,6 +66,7 @@
             <div class="lyrics-scroll" id="lyrics-scroll"><div id="lyrics" class="lyrics"></div></div>
           </section>
           <p class="muted small center" id="practice-note"></p>
+          <section class="card" id="offline-card"></section>
         </section>
 
         <section id="view-sync" class="view" hidden></section>
@@ -100,6 +102,6 @@
 
     <dialog id="dlg" class="dlg"></dialog>
     <div id="toast" class="toast" hidden></div>
-    <script type="module" src="app.js?v=20261116-3"></script>
+    <script type="module" src="app.js?v=20261116-4"></script>
   </body>
 </html>

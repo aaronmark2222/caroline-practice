@@ -97,7 +97,7 @@ body.fs .lyrics-head { position: absolute; top: 0; left: 0; right: 0; z-index: 2
 body.fs .lyrics-scroll { height: 100vh; padding: 0 5vw; }
 body.fs main, body.fs #view-practice { height: 100vh; }
 body.fs .lyrics { font-size: calc(var(--ly-size) * 1.45); }
-body.fs .room-bar { position: fixed; z-index: 31; left: 12px; right: 12px; bottom: calc(var(--tp-h) + 12px); }
+body.fs .room-bar, body.fs #offline-card, body.fs .offline-banner { display: none !important; }
 body.fs.fs-quiet .lyrics-head, body.fs.fs-quiet .transport { opacity: 0; pointer-events: none; }
 
 /* transport */
@@ -193,3 +193,6 @@ details.help li { margin: 4px 0; }
 
 body.view-sync .transport, body.view-sync #mixer { display: none; }
 body.view-sync main { padding-bottom: 40px; }
+
+.offline-banner { background: rgba(255,207,77,.14); border-bottom: 1px solid rgba(255,207,77,.35); color: var(--warn); font-size: 13px; text-align: center; padding: 6px 12px; }
+#offline-card { margin-top: 14px; }

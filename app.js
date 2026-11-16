@@ -13,7 +13,6 @@ const SUPABASE_KEY = 'sb_publishable_bXd0ymwEnYNqQCq1EwH2AA_0HajJecU';
 const db = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { storageKey: 'cp-auth-v1', persistSession: true, autoRefreshToken: true } });
 const USERNAME_DOMAIN = 'example.com';
 const PHONE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-const AUDIO_CACHE = 'cp-audio-v1';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -38,9 +37,15 @@ const state = {
 // ------------------------------------------------------------------ auth
 async function boot() {
   wireStatic();
-  const { data } = await db.auth.getSession();
-  if (data.session) await enter(data.session.user);
-  else showSignin();
+  let data = {}, error = null;
+  try { ({ data, error } = await db.auth.getSession()); } catch (e) { error = e; }
+  if (data?.session) await enter(data.session.user);
+  else {
+    // Offline with an expired sign-in: open from what this device saved (read-only practice).
+    const cached = dataCacheGet();
+    if ((!navigator.onLine || error) && cached?.member) await enter({ id: cached.member.user_id });
+    else showSignin();
+  }
   db.auth.onAuthStateChange((ev, session) => {
     if (ev === 'SIGNED_OUT') showSignin();
     else if (session?.user && !state.user) enter(session.user);
@@ -67,7 +72,10 @@ async function signIn(e) {
 async function enter(user) {
   if (state.user?.id === user.id) return;
   state.user = user;
-  const { data: member, error } = await db.from('cp_users').select('user_id,name,role').eq('user_id', user.id).maybeSingle();
+  let { data: member, error } = await db.from('cp_users').select('user_id,name,role').eq('user_id', user.id).maybeSingle();
+  // No connection: open from what this device saved last time (read-only practice).
+  const cached = dataCacheGet();
+  if (error && cached?.member?.user_id === user.id) { member = cached.member; error = null; state.offline = true; }
   if (error || !member) {
     await db.auth.signOut();
     showSignin(error ? 'Could not reach the server. Check the connection and try again.' : 'This account is not set up for Caroline Practice.');
@@ -77,7 +85,9 @@ async function enter(user) {
   $('#acct-name').textContent = member.name;
   $$('.admin-only').forEach((b) => { b.hidden = member.role !== 'admin'; });
   $('#signin').hidden = true; $('#boot').hidden = true; $('#app').hidden = false;
+  dataCachePut({ member });
   await loadData();
+  renderOfflineBanner();
   setView(member.role === 'admin' && lget('cp-view', 'practice') === 'sync' ? 'sync' : 'practice');
   const last = lget('cp-song', null);
   const first = state.songs.find((s) => s.slug === last) || state.songs[0];
@@ -93,15 +103,29 @@ async function signOut() {
 }
 
 // ------------------------------------------------------------------ data
+// Last loaded data is kept on the device so the app opens with no connection.
+const DATA_CACHE = 'cp-data-cache-v1';
+function dataCacheGet() { return lget(DATA_CACHE, null); }
+function dataCachePut(patch) { lset(DATA_CACHE, { ...(dataCacheGet() || {}), ...patch, savedAt: new Date().toISOString() }); }
+
 async function loadData() {
-  const [songs, meta] = await Promise.all([
-    db.from('cp_songs').select('*').eq('hidden', false).order('position'),
-    db.from('cp_meta').select('key,value'),
-  ]);
-  state.songs = songs.data || [];
-  const set = (meta.data || []).find((m) => m.key === 'set')?.value || {};
-  state.setMeta = set;
-  state.elements = set.elements || [];
+  let songs, meta;
+  try {
+    [songs, meta] = await Promise.all([
+      db.from('cp_songs').select('*').eq('hidden', false).order('position'),
+      db.from('cp_meta').select('key,value'),
+    ]);
+    if (songs.error || meta.error) throw songs.error || meta.error;
+    state.songs = songs.data || [];
+    state.setMeta = (meta.data || []).find((m) => m.key === 'set')?.value || {};
+    state.offline = false;
+    dataCachePut({ songs: state.songs, setMeta: state.setMeta });
+  } catch (e) {
+    const c = dataCacheGet() || {};
+    state.songs = c.songs || []; state.setMeta = c.setMeta || {}; state.offline = true;
+    console.warn('offline: using saved data', e);
+  }
+  state.elements = state.setMeta.elements || [];
   await refreshAudioList();
   renderSongChips();
 }
@@ -118,8 +142,9 @@ async function fn(body) {
 }
 
 async function refreshAudioList() {
-  try { state.audio = (await fn({ action: 'list' })).songs || {}; }
-  catch (e) { state.audio = {}; console.warn('audio list', e); }
+  try { state.audio = (await fn({ action: 'list' })).songs || {}; state.audioLive = true; dataCachePut({ audio: state.audio }); }
+  catch (e) { state.audio = dataCacheGet()?.audio || {}; state.audioLive = false; console.warn('audio list', e); }
+  renderOfflinePanel();
 }
 
 const elementBySlug = (slug) => state.elements.find((e) => e.slug === slug)
@@ -138,37 +163,163 @@ function setView(v) {
 
 function renderSongChips() {
   $('#song-chips').innerHTML = state.songs.map((s) => {
-    const n = Object.keys(state.audio[s.slug] || {}).length;
+    const n = Object.keys(state.audio[s.slug] || {}).length || Object.keys(offline.manifest[s.slug] || {}).length;
     return `<button class="song-chip ${state.song?.slug === s.slug ? 'active' : ''}" data-song="${esc(s.slug)}"><b>${esc(s.name)}</b><span>${fmt(s.duration_seconds)}${s.song_key ? ' · ' + esc(s.song_key) : ''}${s.bpm ? ' · ' + esc(s.bpm) + ' BPM' : ''}${n ? '' : ' · no audio yet'}</span></button>`;
   }).join('') || '<span class="muted">No songs yet.</span>';
 }
 
-// ------------------------------------------------------------------ audio cache
-async function cachedArrayBuffer(song, el, file, onProgress) {
-  const key = `https://cp-cache.local/${song}/${el}?m=${encodeURIComponent(file.modified)}`;
-  let cache = null;
-  try { cache = await caches.open(AUDIO_CACHE); } catch { /* no Cache Storage */ }
-  if (cache) {
-    const hit = await cache.match(key);
-    if (hit) return hit.arrayBuffer();
-  }
+// ------------------------------------------------------------------ offline audio
+// Same idea as TSP Work: every file played is saved on this device (always on),
+// so it downloads once; "Save all" fills the device in one go; a newer upload
+// shows an Update; with no connection the saved copies play. Files live in Cache
+// Storage, with a manifest (version = bytes|upload time) in localStorage.
+const OFFLINE_CACHE = 'cp-practice-audio-v1';
+const OFFLINE_MANIFEST = 'cp-offline-manifest-v1';
+const offline = { manifest: lget(OFFLINE_MANIFEST, {}), job: null, lastError: '', urls: new Map() };
+const offlineSupported = () => typeof caches !== 'undefined';
+const offlineVersion = (f) => `${f?.bytes || 0}|${f?.modified || ''}`;
+const offlineKey = (song, el) => `https://cp-offline.local/${encodeURIComponent(song)}/${encodeURIComponent(el)}`;
+function offlineSaveManifest() { lset(OFFLINE_MANIFEST, offline.manifest); }
+try { navigator.storage?.persist?.(); } catch { /* ignore */ }
+try { caches.delete('cp-audio-v1'); } catch { /* the old cache name */ }
+
+// Songs opened in this visit stay in memory (compressed), so going back never downloads again.
+const memBlobs = new Map();
+const MEM_BUDGET = (PHONE ? 200 : 600) * 1048576;
+function memGet(song, el, v) { const k = `${song}|${el}|${v}`; const b = memBlobs.get(k); if (b) { memBlobs.delete(k); memBlobs.set(k, b); } return b || null; }
+function memPut(song, el, v, blob) {
+  for (const k of [...memBlobs.keys()]) if (k.startsWith(`${song}|${el}|`)) memBlobs.delete(k);
+  memBlobs.set(`${song}|${el}|${v}`, blob);
+  let total = 0; for (const b of memBlobs.values()) total += b.size;
+  for (const [k, b] of memBlobs) { if (total <= MEM_BUDGET) break; if (k.startsWith(`${song}|`)) continue; memBlobs.delete(k); total -= b.size; }
+}
+async function offlineRead(song, el) {
+  if (!offlineSupported() || !offline.manifest[song]?.[el]) return null;
+  try { const res = await (await caches.open(OFFLINE_CACHE)).match(offlineKey(song, el)); return res ? await res.blob() : null; } catch { return null; }
+}
+async function offlineWrite(song, el, file, blob) {
+  if (!offlineSupported()) return;
+  const ext = file.ext || 'm4a';
+  await (await caches.open(OFFLINE_CACHE)).put(offlineKey(song, el), new Response(blob, { headers: { 'Content-Type': ext === 'mp3' ? 'audio/mpeg' : ext === 'wav' ? 'audio/wav' : 'audio/mp4' } }));
+  (offline.manifest[song] ||= {})[el] = { v: offlineVersion(file), bytes: blob.size, ext, modified: file.modified || '' };
+  offlineSaveManifest();
+}
+// A saved copy that is the current upload (or any saved copy when offline / no link).
+function offlineIsCurrent(song, el, file) {
+  const m = offline.manifest[song]?.[el];
+  return !!m && (!file?.url || file.offline || m.v === offlineVersion(file));
+}
+async function offlineTrackBlob(song, el, file, onProgress) {
+  const v = offlineVersion(file);
+  const inMem = memGet(song, el, v); if (inMem) return inMem;
+  if (offlineIsCurrent(song, el, file)) { const b = await offlineRead(song, el); if (b) { memPut(song, el, v, b); return b; } }
+  if (!file?.url) throw new Error('not saved on this device, and no connection');
   const res = await fetch(file.url);
   if (!res.ok) throw new Error(`download failed (${res.status})`);
   const total = Number(res.headers.get('content-length')) || file.bytes || 0;
-  let buf;
+  let blob;
   if (res.body && onProgress && total) {
     const reader = res.body.getReader(); const parts = []; let got = 0;
     for (;;) { const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length; onProgress(got / total); }
-    buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
-    buf = buf.buffer;
-  } else buf = await res.arrayBuffer();
-  if (cache) {
-    try {
-      for (const req of await cache.keys()) if (req.url.startsWith(`https://cp-cache.local/${song}/${el}?`)) await cache.delete(req);
-      await cache.put(key, new Response(buf.slice(0), { headers: { 'content-type': 'audio/mpeg' } }));
-    } catch { /* storage full: fine, play from memory */ }
+    blob = new Blob(parts, { type: res.headers.get('content-type') || 'audio/mp4' });
+  } else blob = await res.blob();
+  memPut(song, el, v, blob);
+  try { await offlineWrite(song, el, file, blob); offline.lastError = ''; }
+  catch (e) { offline.lastError = `${e?.name || 'Error'}: ${e?.message || e}`; console.warn('not saved on device', e); }
+  renderOfflinePanel();
+  return blob;
+}
+function offlineStats() {
+  let files = 0, bytes = 0, mixdowns = 0, multitracks = 0;
+  for (const [song, saved] of Object.entries(offline.manifest)) {
+    for (const m of Object.values(saved)) { files += 1; bytes += m.bytes || 0; }
+    if (saved.mixdown) mixdowns += 1;
+    const parts = Object.keys(state.audio[song] || {}).filter((el) => el !== 'mixdown');
+    const savedParts = Object.keys(saved).filter((el) => el !== 'mixdown');
+    if (parts.length ? parts.every((el) => saved[el]) : savedParts.length) multitracks += 1;
   }
-  return buf;
+  return { files, bytes, mixdowns, multitracks };
+}
+// Saved files whose upload is newer.
+function offlineUpdates() {
+  const out = [];
+  if (!state.audioLive) return out;
+  for (const [song, saved] of Object.entries(offline.manifest)) {
+    for (const [el, m] of Object.entries(saved)) {
+      const up = state.audio[song]?.[el];
+      if (up && m.v !== offlineVersion(up)) out.push({ song, el, bytes: up.bytes || 0 });
+    }
+  }
+  return out;
+}
+async function offlineDownload(slugs, { everything, onlyUpdates } = {}) {
+  if (offline.job || !offlineSupported()) return;
+  const job = { done: 0, total: 0, bytes: 0, totalBytes: 0, failed: 0, current: '', cancelled: false };
+  offline.job = job;
+  const plan = [];
+  for (const song of slugs) {
+    for (const [el, f] of Object.entries(state.audio[song] || {})) {
+      if (!everything && !onlyUpdates && el !== 'mixdown') continue;
+      const saved = offline.manifest[song]?.[el];
+      if (saved && saved.v === offlineVersion(f)) continue;
+      if (onlyUpdates && !saved) continue;
+      plan.push({ song, el, bytes: f.bytes || 0 });
+    }
+  }
+  job.total = plan.length; job.totalBytes = plan.reduce((a, p) => a + p.bytes, 0);
+  renderOfflinePanel();
+  for (const song of [...new Set(plan.map((p) => p.song))]) {
+    if (job.cancelled) break;
+    let files;
+    try { files = (await fn({ action: 'urls', song })).files || {}; } catch { const n = plan.filter((p) => p.song === song).length; job.failed += n; job.done += n; continue; }
+    for (const item of plan.filter((p) => p.song === song)) {
+      if (job.cancelled) break;
+      const f = files[item.el];
+      job.current = `${state.songs.find((x) => x.slug === song)?.name || song} · ${elementBySlug(item.el).label}`;
+      renderOfflinePanel();
+      try {
+        if (!f) throw new Error('missing');
+        const res = await fetch(f.url); if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        await offlineWrite(song, item.el, f, blob);
+        job.bytes += blob.size;
+      } catch (e) { job.failed += 1; console.warn('offline save failed', song, item.el, e); }
+      job.done += 1; renderOfflinePanel();
+    }
+  }
+  offline.job = null;
+  toast(job.cancelled ? 'Stopped saving audio.' : `Saved ${job.done - job.failed} file${job.done - job.failed === 1 ? '' : 's'} on this device${job.failed ? ` (${job.failed} failed — try again on a better connection)` : ''}.`);
+  renderOfflinePanel(); renderSongChips();
+}
+async function offlineClear() {
+  if (!confirm('Delete the practice audio saved on this device? It saves again as songs are played.')) return;
+  try { await caches.delete(OFFLINE_CACHE); } catch { /* ignore */ }
+  offline.manifest = {}; offlineSaveManifest(); memBlobs.clear();
+  renderOfflinePanel(); renderSongChips();
+}
+function renderOfflinePanel() {
+  const box = $('#offline-card'); if (!box) return;
+  if (!offlineSupported()) { box.innerHTML = '<h2>Offline audio</h2><p class="muted small">This browser cannot save audio on the device.</p>'; return; }
+  const st = offlineStats(), ups = offlineUpdates(), job = offline.job;
+  const upBytes = ups.reduce((a, u) => a + u.bytes, 0);
+  const all = state.songs.map((x) => x.slug).filter((sl) => state.audio[sl]);
+  const totalMix = all.filter((sl) => state.audio[sl]?.mixdown).length;
+  const prog = job ? `<div style="margin-top:10px"><div class="bar"><i style="width:${job.totalBytes ? Math.round(job.bytes / job.totalBytes * 100) : Math.round(job.done / Math.max(1, job.total) * 100)}%"></i></div>
+    <p class="small">Saving ${job.done} of ${job.total}${job.current ? ` · ${esc(job.current)}` : ''} · ${mb(job.bytes)} of ${mb(job.totalBytes)} <button class="btn small" id="off-stop">Stop</button></p></div>` : '';
+  box.innerHTML = `<div class="row"><h2 style="margin:0">Offline audio</h2><span class="ok small">● On</span><span class="spacer"></span><span class="muted small">${state.offline || !navigator.onLine ? 'No connection — playing saved audio' : ''}</span></div>
+    <p class="muted small">Songs are saved on this device as you play them, so they download once and play with no internet.</p>
+    <p class="small">Saved: <b>${st.mixdowns}</b> of ${totalMix} Mixdowns · <b>${st.multitracks}</b> full multitrack${st.multitracks === 1 ? '' : 's'} · ${st.files} files, ${mb(st.bytes)}</p>
+    ${ups.length ? `<p class="warnc small">${ups.length} saved file${ups.length === 1 ? ' has' : 's have'} a newer version (${mb(upBytes)}). <button class="btn small" id="off-update" ${job ? 'disabled' : ''}>Update</button></p>` : ''}
+    <div class="row">
+      <button class="btn small" id="off-mix" ${job || state.offline ? 'disabled' : ''}>Save all Mixdowns</button>
+      <button class="btn small" id="off-all" ${job || state.offline ? 'disabled' : ''}>Save everything</button>
+      <span class="spacer"></span>
+      <button class="btn small ghost" id="off-clear" ${job || !st.files ? 'disabled' : ''}>Delete saved audio</button></div>
+    ${prog}${offline.lastError ? `<p class="badc small">Could not save on this device: ${esc(offline.lastError)}</p>` : ''}`;
+}
+function renderOfflineBanner() {
+  const off = state.offline || !navigator.onLine;
+  const b = $('#offline-banner'); if (b) b.hidden = !off;
 }
 
 // ------------------------------------------------------------------ engine
@@ -290,9 +441,34 @@ async function setMode(mode) {
 
 async function getFiles(slug) {
   if (pt.filesFor === slug && Date.now() - pt.filesAt < 2.5 * 3600e3) return pt.files;
-  const { files } = await fn({ action: 'urls', song: slug });
-  pt.files = files || {}; pt.filesFor = slug; pt.filesAt = Date.now();
+  let files;
+  try { files = (await fn({ action: 'urls', song: slug })).files || {}; pt.filesAt = Date.now(); }
+  catch (e) {
+    // No connection: what this device has saved for the song.
+    const saved = offline.manifest[slug] || {};
+    if (!Object.keys(saved).length) throw e;
+    files = Object.fromEntries(Object.entries(saved).map(([el, m]) => [el, { url: null, offline: true, bytes: m.bytes, modified: m.modified, ext: m.ext }]));
+    pt.filesAt = 0;
+  }
+  pt.files = files; pt.filesFor = slug;
   return pt.files;
+}
+// Mixdown: the saved copy when there is a current one (plays offline); otherwise it
+// streams straight away and a copy is saved in the background for next time.
+async function setMixdownSource(slug, file) {
+  const token = pt.loadingToken;
+  if (offlineIsCurrent(slug, 'mixdown', file)) {
+    const blob = memGet(slug, 'mixdown', offlineVersion(file)) || await offlineRead(slug, 'mixdown');
+    if (token !== pt.loadingToken) return;
+    if (blob) {
+      const old = offline.urls.get('mix'); if (old) URL.revokeObjectURL(old);
+      const url = URL.createObjectURL(blob); offline.urls.set('mix', url);
+      pt.audio.src = url; return;
+    }
+  }
+  if (!file.url) { $('#practice-note').textContent = 'The Mixdown is not saved on this device and there is no connection.'; return; }
+  pt.audio.src = file.url;
+  offlineTrackBlob(slug, 'mixdown', file).catch(() => {});
 }
 
 // Decode a track (first time it is needed) and attach it to a playing mix.
@@ -302,7 +478,7 @@ async function ensureTrack(t) {
   t.loading = (async () => {
     try {
       const ctx = ensureCtx();
-      const buf = await cachedArrayBuffer(state.song.slug, t.slug, pt.files[t.slug], (p) => { t.progress = p; renderMixerRow(t); });
+      const buf = await (await offlineTrackBlob(state.song.slug, t.slug, pt.files[t.slug], (p) => { t.progress = p; renderMixerRow(t); })).arrayBuffer();
       if (token !== pt.loadingToken) return;
       let audioBuf = await ctx.decodeAudioData(buf);
       audioBuf = collapseDualMono(ctx, audioBuf);
@@ -353,13 +529,13 @@ async function selectSong(slug, opts = {}) {
   if (!opts.fromRoom) roomHostSend(true);
   if (room.following) { renderTransport(); return; }   // followers hold no audio
   let files;
-  try { files = await getFiles(slug); } catch (e) { $('#practice-note').textContent = `Could not load audio: ${e.message}`; return; }
+  try { files = await getFiles(slug); } catch (e) { $('#practice-note').textContent = state.offline || !navigator.onLine ? 'No connection, and this song is not saved on this device yet.' : `Could not load audio: ${e.message}`; return; }
   if (state.song?.slug !== slug) return;
   const order = state.elements.map((e) => e.slug);
   pt.tracks = Object.keys(files).filter((k) => k !== 'mixdown')
     .sort((a, b) => (order.indexOf(a) + 1 || 999) - (order.indexOf(b) + 1 || 999))
     .map((k) => { const e = elementBySlug(k); return { slug: k, label: e.label, color: e.color, kind: e.kind, bytes: files[k].bytes }; });
-  if (files.mixdown) pt.audio.src = files.mixdown.url;
+  if (files.mixdown) setMixdownSource(slug, files.mixdown);
   if (!files.mixdown && !pt.tracks.length) $('#practice-note').textContent = 'No practice audio for this song yet — lyrics only.';
   if (pt.mode === 'multi' || !files.mixdown) loadAudibleTracks();
   renderTransport(); renderMixer(); mediaSessionUpdate();
@@ -420,6 +596,30 @@ function tick() {
     lyricsUpdate(pos);
     if (!$('#mixer').hidden) meters();
     if ((engineIsPlaying() ? 1 : 0) !== tick.wasPlaying) { tick.wasPlaying = engineIsPlaying() ? 1 : 0; renderTransport(); }
+  }
+  $('#offline-card').addEventListener('click', (e) => {
+    const all = state.songs.map((x) => x.slug);
+    if (e.target.id === 'off-mix') offlineDownload(all);
+    if (e.target.id === 'off-all') offlineDownload(all, { everything: true });
+    if (e.target.id === 'off-update') offlineDownload(all, { onlyUpdates: true });
+    if (e.target.id === 'off-stop' && offline.job) offline.job.cancelled = true;
+    if (e.target.id === 'off-clear') offlineClear();
+  });
+  window.addEventListener('online', async () => { renderOfflineBanner(); if (state.member) { await loadData(); renderOfflineBanner(); renderOfflinePanel(); } });
+  window.addEventListener('offline', () => { renderOfflineBanner(); renderOfflinePanel(); });
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch((e) => console.warn('service worker', e));
+    // Also put what this page is running into the app cache, so the very first
+    // visit already opens with no connection.
+    window.addEventListener('load', () => setTimeout(async () => {
+      try {
+        const cache = await caches.open('cp-app-shell-v1');
+        const urls = new Set([new URL('./', location.href).href, new URL('index.html', location.href).href, new URL('vendor/lamejs.js', location.href).href]);
+        for (const e of performance.getEntriesByType('resource')) { const u = new URL(e.name); if ((u.origin === location.origin && u.pathname.startsWith(new URL('./', location.href).pathname) && !u.pathname.endsWith('sw.js')) || u.hostname === 'esm.sh') urls.add(u.href); }
+        for (const el of document.querySelectorAll('script[src], link[rel=stylesheet][href], link[rel~=icon][href]')) urls.add(new URL(el.src || el.href, location.href).href);
+        await Promise.all([...urls].map((u) => cache.match(u).then((hit) => hit || cache.add(u)).catch(() => {})));
+      } catch { /* ignore */ }
+    }, 3000));
   }
   requestAnimationFrame(tick);
 }
