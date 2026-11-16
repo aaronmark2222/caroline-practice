@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://esm.sh; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data: https://*.r2.cloudflarestorage.com; connect-src 'self' blob: data: https://hzvfrvjuqvmkeqbrgmqu.supabase.co wss://hzvfrvjuqvmkeqbrgmqu.supabase.co https://*.r2.cloudflarestorage.com https://esm.sh; font-src 'self' data:; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#14110f">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Practice">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png?v=1">
+    <link rel="icon" href="apple-touch-icon.png?v=1">
+    <title>Caroline Practice</title>
+    <link rel="stylesheet" href="styles.css?v=20261116-1">
+  </head>
+  <body>
+    <div id="boot" class="boot">Opening…</div>
+
+    <section id="signin" class="signin" hidden>
+      <form id="signin-form" class="signin-card" autocomplete="on">
+        <div class="brand-mark" aria-hidden="true">♪</div>
+        <h1>Caroline Practice</h1>
+        <p class="muted">Sign in to practise the annual day songs.</p>
+        <label>Username or email
+          <input id="si-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        </label>
+        <label>Password
+          <input id="si-pass" name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="btn primary" type="submit">Sign in</button>
+        <p id="si-msg" class="msg" role="status"></p>
+      </form>
+    </section>
+
+    <div id="app" hidden>
+      <header class="topbar">
+        <div class="brand"><span class="brand-dot">♪</span> Caroline Practice</div>
+        <nav class="tabs">
+          <button class="tab active" data-view="practice">Practice</button>
+          <button class="tab admin-only" data-view="sync" hidden>Ableton Sync</button>
+        </nav>
+        <div class="account">
+          <button id="acct-btn" class="btn ghost small" aria-haspopup="true"><span id="acct-name"></span> ▾</button>
+          <div id="acct-menu" class="menu" hidden>
+            <button id="acct-pass">Change password</button>
+            <button id="acct-out">Sign out</button>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section id="view-practice" class="view">
+          <div class="songs-row" id="song-chips"></div>
+          <div id="room-bar" class="room-bar" hidden></div>
+          <section class="card lyrics-card" id="lyrics-card">
+            <div class="lyrics-head">
+              <div class="ly-tracks" id="ly-tracks"></div>
+              <div class="ly-tools">
+                <button class="icon-btn" id="btn-room" title="Group practice">👥</button>
+                <button class="icon-btn" id="btn-size" title="Text size">Aa</button>
+                <button class="icon-btn" id="btn-fs" title="Full screen">⛶</button>
+              </div>
+            </div>
+            <div class="lyrics-scroll" id="lyrics-scroll"><div id="lyrics" class="lyrics"></div></div>
+          </section>
+          <p class="muted small center" id="practice-note"></p>
+        </section>
+
+        <section id="view-sync" class="view" hidden></section>
+      </main>
+
+      <div id="mixer" class="mixer" hidden></div>
+
+      <footer class="transport" id="transport">
+        <div class="tp-row tp-top">
+          <button class="tp-song" id="tp-song" title="Choose song"><span id="tp-title">—</span> <span class="caret">▾</span></button>
+          <span class="chip" id="tp-key"></span>
+          <span class="chip" id="tp-bpm"></span>
+          <span class="chip" id="tp-bar"></span>
+          <div class="tp-modes" id="tp-modes">
+            <button data-mode="mix" class="mode">Mixdown</button>
+            <button data-mode="multi" class="mode">Multitrack</button>
+            <button id="tp-mixer" class="mode mixer-btn" title="Mixer">🎚</button>
+          </div>
+        </div>
+        <div class="tp-row tp-mid">
+          <button class="tp-btn" id="tp-prev" title="Previous song">⏮</button>
+          <button class="tp-btn" id="tp-start" title="Back to start">⇤</button>
+          <button class="tp-btn play" id="tp-play" title="Play / pause (space)">▶</button>
+          <button class="tp-btn" id="tp-stop" title="Stop">■</button>
+          <button class="tp-btn" id="tp-next" title="Next song">⏭</button>
+          <span class="time" id="tp-pos">0:00</span>
+          <input type="range" id="tp-seek" min="0" max="1000" value="0" step="1" aria-label="Position">
+          <span class="time" id="tp-len">0:00</span>
+        </div>
+        <div class="tp-status" id="tp-status"></div>
+      </footer>
+    </div>
+
+    <dialog id="dlg" class="dlg"></dialog>
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="app.js?v=20261116-1"></script>
+  </body>
+</html>
