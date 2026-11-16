@@ -373,6 +373,20 @@ function enginePosition() {
   if (engineMode() === 'mix') return pt.audio.currentTime || 0;
   return pt.playing ? pt.offset + (pt.ctx.currentTime - pt.startAt) : pt.offset;
 }
+// What you hear lags what the engine reports by the output latency (Bluetooth
+// headphones and AirPods add ~0.1–0.3 s), so the lyrics, bar counter and room
+// followers use the position you actually hear.
+function outputLatency() {
+  const c = pt.ctx;
+  if (!c) return 0;
+  const l = (Number(c.outputLatency) || 0) + (Number(c.baseLatency) || 0);
+  return Math.max(0, Math.min(0.6, l));
+}
+function heardPosition() {
+  const pos = enginePosition();
+  if (room.following || !engineIsPlaying()) return pos;
+  return Math.max(0, pos - outputLatency());
+}
 const engineIsPlaying = () => (room.following ? room.anchor?.playing : engineMode() === 'mix' ? !pt.audio.paused : pt.playing);
 
 function stopSources() {
@@ -390,6 +404,7 @@ async function enginePlay() {
   if (engineMode() === 'mix') {
     if (!pt.audio.src) return;
     if (pt.audio.ended || pt.audio.currentTime >= songDuration() - 0.05) pt.audio.currentTime = 0;
+    try { const c = ensureCtx(); if (c.state !== 'running') c.resume(); } catch { /* latency stays 0 */ }
     try { await pt.audio.play(); } catch (e) { toast('Tap play again to start audio.'); console.warn(e); }
   } else {
     const ctx = ensureCtx();
@@ -586,9 +601,10 @@ function renderTransport() {
 function tick() {
   const s = state.song;
   if (s) {
-    const pos = enginePosition();
+    const raw = enginePosition();
+    const pos = heardPosition();
     const dur = room.following ? (room.anchor?.duration || s.duration_seconds) : songDuration();
-    if (!room.following && engineMode() === 'multi' && pt.playing && pos >= dur - 0.02) { pt.playing = false; stopSources(); pt.offset = dur; afterTransport(); }
+    if (!room.following && engineMode() === 'multi' && pt.playing && raw >= dur - 0.02) { pt.playing = false; stopSources(); pt.offset = dur; afterTransport(); }
     $('#tp-pos').textContent = fmt(pos);
     if (!seeking) $('#tp-seek').value = dur ? Math.round((pos / dur) * 1000) : 0;
     liveChips(pos);
@@ -640,7 +656,8 @@ function liveChips(pos) {
       beats += (Math.min(pos, t1) - t0) * b0 / 60;
     }
     const per = (ly.sig?.[0] || 4) * 4 / (ly.sig?.[1] || 4);
-    $('#tp-bar').textContent = `Bar ${Math.floor(beats / per) + 1}.${Math.floor(beats % per) + 1}`;
+    const whole = Math.floor(beats + 1e-6);          // 7.9999999 at a downbeat is beat 8
+    $('#tp-bar').textContent = `Bar ${Math.floor(whole / per) + 1}.${(whole % per) + 1}`;
   } else $('#tp-bar').textContent = '';
 }
 
@@ -894,7 +911,7 @@ function roomHostSend(force) {
   if (!force && now - room.lastSend < 450) return;
   room.lastSend = now;
   room.channel.send({ type: 'broadcast', event: 'state', payload: {
-    song: state.song.slug, pos: enginePosition(), at: now, playing: !!engineIsPlaying(), duration: songDuration(), host: state.member?.name,
+    song: state.song.slug, pos: heardPosition(), at: now, playing: !!engineIsPlaying(), duration: songDuration(), host: state.member?.name,
   } });
 }
 function roomOnState(p) {
@@ -1028,7 +1045,10 @@ function wireStatic() {
   $('#btn-fs').addEventListener('click', () => toggleFs());
   $('#btn-room').addEventListener('click', roomDialog);
   $('#room-bar').addEventListener('click', (e) => { if (e.target.id === 'room-end') roomLeave(); });
-  ['mousemove', 'touchstart', 'keydown'].forEach((ev) => document.addEventListener(ev, fsPoke, { passive: true }));
+  // Only a real mouse movement brings the full-screen controls back: browsers also fire
+  // mousemove when the lyrics scroll under a pointer that is not moving (every new line).
+  document.addEventListener('mousemove', (e) => { if (e.movementX || e.movementY) fsPoke(); }, { passive: true });
+  ['touchstart', 'keydown'].forEach((ev) => document.addEventListener(ev, fsPoke, { passive: true }));
 
   $('#tp-play').addEventListener('click', () => (engineIsPlaying() ? enginePause() : enginePlay()));
   $('#tp-stop').addEventListener('click', engineStop);

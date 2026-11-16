@@ -1,6 +1,6 @@
 # Caroline Practice — App Plan (master document)
 
-_Last reconciled: **2026-11-16** · cache markers `app.js?v=20261116-4`, `styles.css?v=20261116-4`, `sw.js`, `als.js?v=20261116-1` · Supabase migration `caroline_practice_init` · Edge Function `caroline-audio` **v2** · Ableton control surface **CarolineSync 1.0** · published from branch `gh-pages`._
+_Last reconciled: **2026-11-16** · cache markers `app.js?v=20261116-5`, `styles.css?v=20261116-4`, `sw.js`, `als.js?v=20261116-1` · Supabase migration `caroline_practice_init` · Edge Function `caroline-audio` **v2** · Ableton control surface **CarolineSync 1.0** · published from branch `gh-pages`._
 
 The single source of truth for resuming work on **Caroline Practice**, a side project of the TSP Band App (TSP Work). Read sections 0–4 before changing anything. Live code and databases win over this file; this file wins over memory.
 
@@ -91,6 +91,8 @@ Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated onl
   - Mixdown streams through one `<audio>` element. Multitrack decodes each track into Web Audio (phones at 24 kHz; identical-channel tracks stored mono), plays them in step; tracks are decoded only when audible; files come through the offline store below.
   - Mixer per track: On/Off, additive Solo (solo overrides off), volume −∞…+6 dB, meter. Stems off by default. Settings persist for the browser session (`sessionStorage cp-mixer`).
   - Lyrics: AbleSet syntax — `[X]` chord box, `[Key:] [C]` key line, `\` line break; a line sits under the section holding most of it; current line enlarges; autoscroll ported from TSP Work: the current line is placed 35% down the box, measured with getBoundingClientRect (so it is right in any layout), eased glide on computers and Safari's native smooth scroll on phones, paused 4 s after any hand scroll (touch, wheel, keys, scrollbar); `lyricsFit()` sizes the box to end just above the playback bar and sets the top/bottom padding from the box height (18% / 62%); click a line/section to seek. Default track: Lyrics (choice remembered per device).
+  - **Heard position:** lyrics, the Key/BPM/Bar chips and the room host's broadcast use the engine position minus the output latency (`AudioContext.outputLatency + baseLatency`, capped 0.6 s; an AudioContext is started with the Mixdown too so it can be read), so they match what is heard on Bluetooth/AirPods. Bar.Beat rounds with a 1e-6 tolerance so an exact downbeat never reads as the previous beat.
+  - Full screen: the controls hide 3 s after the last touch/key/real mouse movement while playing; mousemove events with no movement (fired when lyrics scroll under a still pointer) are ignored.
   - Keyboard: Space play/pause, F full screen, ←/→ ±5 s. Lock screen controls via Media Session. Screen kept awake while playing or following.
 - **Offline (ported from TSP Work, 16 Nov 2026):**
   - `sw.js` service worker (scope `/caroline-practice/`, cache `cp-app-shell-v1`): network-first for the app's own files, cache-first for esm.sh; the page also adds what it is running to that cache, so the first visit already works offline.
@@ -136,5 +138,6 @@ Headless Chrome (Playwright) with a fake supabase-js module (routes esm.sh) and 
 
 - **2026-11-16:** Created.
 - **2026-11-16:** Added CarolineSync (Export from Ableton) and `upload_batch`.
+- **2026-11-16:** Bar counter reported one count ahead (Aaron): exported Click files checked — first click is exactly at 0:00, and the counter reads 1.1 for the whole first beat in the test browser; display now follows the heard position (output latency). Full-screen controls no longer reappear at every new line.
 - **2026-11-16:** Offline app + offline audio (as TSP Work); room bar hidden in full screen.
 - **2026-11-16:** Fixed page-mode lyrics scrolling (it used offsetTop, which put the line at the top outside full screen); now the same method as TSP Work. Measured 35% down on desktop, phone and full screen.
