@@ -197,3 +197,6 @@ body.view-sync main { padding-bottom: 40px; }
 .offline-banner { background: rgba(255,207,77,.14); border-bottom: 1px solid rgba(255,207,77,.35); color: var(--warn); font-size: 13px; text-align: center; padding: 6px 12px; }
 #offline-card { margin-top: 14px; }
 body.fs .lyrics-scroll { overscroll-behavior: contain; }
+.room-bar .warn { color: #f5c451; font-weight: 600; }
+.room-bar .room-end-mode { display: inline-flex; align-items: center; gap: 6px; }
+.room-bar select { background: rgba(0,0,0,.35); color: inherit; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; padding: 4px 6px; font: inherit; }

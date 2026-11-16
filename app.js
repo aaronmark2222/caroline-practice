@@ -335,7 +335,7 @@ function renderOfflineBanner() {
 // Rows are kept in a queue on the device first, so nothing is lost offline or when a
 // tab is closed; they are sent every 15 s and when the connection returns. Only the
 // admin can read everyone's rows (Ableton Sync › Usage).
-const APP_VERSION = '20261117-1';
+const APP_VERSION = '20261117-2';
 const AQ_KEY = 'cp-analytics-queue-v1';
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
 const ana = {
@@ -546,7 +546,7 @@ function heardPosition() {
   if (room.following || !engineIsPlaying()) return pos;
   return Math.max(0, pos - outputLatency());
 }
-const engineIsPlaying = () => (room.following ? room.anchor?.playing : engineMode() === 'mix' ? !pt.audio.paused : pt.playing);
+const engineIsPlaying = () => (room.following ? roomIsPlaying() : engineMode() === 'mix' ? !pt.audio.paused : pt.playing);
 
 function stopSources() {
   for (const t of pt.tracks) { try { t.src?.stop(); } catch { /* already stopped */ } t.src = null; }
@@ -560,6 +560,7 @@ function startSource(t, when, offset) {
 async function enginePlay() {
   if (room.following) return roomCmd('play');
   if (!state.song) return;
+  roomCancelAuto(true);
   if (engineMode() === 'mix') {
     if (!pt.audio.src) return;
     if (pt.audio.ended || pt.audio.currentTime >= songDuration() - 0.05) pt.audio.currentTime = 0;
@@ -579,6 +580,7 @@ async function enginePlay() {
 function enginePause() {
   if (engineIsPlaying()) anaCount('pauses');
   if (room.following) return roomCmd('pause');
+  roomCancelAuto();
   if (engineMode() === 'mix') pt.audio.pause();
   else if (pt.playing) { pt.offset = enginePosition(); stopSources(); pt.playing = false; }
   afterTransport();
@@ -586,6 +588,7 @@ function enginePause() {
 function engineSeek(sec) {
   anaCount('seeks');
   if (room.following) return roomCmd('seek', { t: sec });
+  roomCancelAuto();
   sec = Math.max(0, Math.min(sec, songDuration()));
   if (engineMode() === 'mix') { try { pt.audio.currentTime = sec; } catch { /* not loaded */ } }
   else if (pt.playing) { stopSources(); pt.offset = sec; pt.startAt = pt.ctx.currentTime + 0.03; for (const t of pt.tracks) startSource(t, pt.startAt, sec); }
@@ -695,6 +698,7 @@ async function selectSong(slug, opts = {}) {
   if (!song) return;
   const wasPlaying = !room.following && engineIsPlaying() && !opts.quiet;
   if (!room.following && state.song) enginePause();
+  if (!opts.auto) roomCancelAuto(true);
   state.song = song; lset('cp-song', slug);
   pt.loadingToken += 1;
   stopSources(); pt.playing = false; pt.offset = 0;
@@ -728,7 +732,7 @@ function neighbour(d) {
 }
 
 pt.audio.addEventListener('error', () => { if (pt.audio.getAttribute('src')) anaEvent('audio_error', { track: 'mixdown', code: pt.audio.error?.code || null, message: pt.audio.error?.message || '' }); });
-pt.audio.addEventListener('ended', () => { renderTransport(); roomHostSend(true); });
+pt.audio.addEventListener('ended', () => { renderTransport(); roomHostSend(true); songEnded(); });
 pt.audio.addEventListener('play', () => afterTransport());
 pt.audio.addEventListener('pause', () => afterTransport());
 pt.audio.addEventListener('loadedmetadata', () => renderTransport());
@@ -756,7 +760,8 @@ function renderTransport() {
     const p = loading.reduce((a, t) => a + (t.progress || 0), 0) / loading.length;
     status = `Loading tracks… ${Math.round(p * 100)}%`;
   }
-  if (room.following) status = `Following ${room.hostName || 'the host'} · ${room.syncMs != null ? `synced ±${room.syncMs} ms` : 'syncing…'}`;
+  const rs = room.code ? roomStatusText() : '';
+  if (rs) status = rs;
   $('#tp-status').textContent = status;
   document.body.classList.toggle('following', room.following);
 }
@@ -765,10 +770,9 @@ function tick() {
   try { anaTick(); } catch (e) { /* analytics never breaks playback */ }
   const s = state.song;
   if (s) {
-    const raw = enginePosition();
     const pos = heardPosition();
     const dur = room.following ? (room.anchor?.duration || s.duration_seconds) : songDuration();
-    if (!room.following && engineMode() === 'multi' && pt.playing && raw >= dur - 0.02) { pt.playing = false; stopSources(); pt.offset = dur; afterTransport(); }
+    checkSongEnd();
     $('#tp-pos').textContent = fmt(pos);
     if (!seeking) $('#tp-seek').value = dur ? Math.round((pos / dur) * 1000) : 0;
     liveChips(pos);
@@ -785,7 +789,7 @@ function tick() {
     if (e.target.id === 'off-stop' && offline.job) offline.job.cancelled = true;
     if (e.target.id === 'off-clear') offlineClear();
   });
-  window.addEventListener('online', async () => { renderOfflineBanner(); if (state.member) { await loadData(); renderOfflineBanner(); renderOfflinePanel(); } });
+  window.addEventListener('online', async () => { roomWake(); renderOfflineBanner(); if (state.member) { await loadData(); renderOfflineBanner(); renderOfflinePanel(); } });
   window.addEventListener('offline', () => { renderOfflineBanner(); renderOfflinePanel(); });
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch((e) => console.warn('service worker', e));
@@ -1023,52 +1027,129 @@ function fsPoke() {
 // ------------------------------------------------------------------ group practice (rooms)
 // One device plays (the host); the others follow its playhead for the lyrics and can drive
 // its transport. Supabase Realtime broadcast; clocks matched by round trips (shortest wins).
+// The connection is watched every second: a dropped or silent channel is rebuilt by itself
+// (phones drop the socket when the screen locks or the network changes), a follower never
+// runs on past the host's last message, and the host moves on to the next song at the end.
 const room = {
   code: null, channel: null, host: false, following: false, anchor: null, offset: 0, bestRtt: Infinity, syncMs: null,
   members: 0, hostName: '', device: sget('cp-device', null) || Math.random().toString(36).slice(2, 10), lastSend: 0, pingTimer: 0, sendTimer: 0, lastHostSeen: 0,
+  gen: 0, status: '', connectAt: 0, retry: 0, reconnectTimer: 0, watchTimer: 0, lastHello: 0, hostPresent: false, presenceAt: 0,
+  endMode: lget('cp-room-end', 'next'), autoAt: 0, autoTimer: 0, autoSong: null, barKey: '',
 };
 sset('cp-device', room.device);
 const roomCodeGen = () => Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
+const ROOM_STALE_MS = 3000;        // a follower stops moving on when the host is silent this long
+const ROOM_AUTO_MS = 5000;         // "Play the next song": countdown before it starts
 
 async function roomOpen(code, host) {
   anaEvent('room', { action: host ? 'create' : 'join', code });
   await roomLeave(true);
   room.code = code; room.host = host; room.following = !host; room.anchor = null; room.offset = 0; room.bestRtt = Infinity; room.syncMs = null;
+  room.lastHostSeen = 0; room.retry = 0; room.hostPresent = false; room.presenceAt = 0; room.members = 0; roomCancelAuto(true);
   sset('cp-room', { code, host });
-  const ch = db.channel(`cp-room-${code}`, { config: { broadcast: { self: false }, presence: { key: room.device } } });
-  room.channel = ch;
-  ch.on('broadcast', { event: 'state' }, ({ payload }) => roomOnState(payload));
-  ch.on('broadcast', { event: 'ping' }, ({ payload }) => { if (room.host) ch.send({ type: 'broadcast', event: 'pong', payload: { ...payload, th: Date.now() } }); });
-  ch.on('broadcast', { event: 'pong' }, ({ payload }) => roomOnPong(payload));
-  ch.on('broadcast', { event: 'cmd' }, ({ payload }) => roomOnCmd(payload));
-  ch.on('broadcast', { event: 'hello' }, () => roomHostSend(true));
-  ch.on('broadcast', { event: 'bye' }, () => { if (room.following) { toast('The host ended the room.'); roomLeave(); } });
-  ch.on('presence', { event: 'sync' }, () => { room.members = Object.keys(ch.presenceState()).length; renderRoomBar(); });
-  ch.subscribe(async (status) => {
-    if (status === 'SUBSCRIBED') {
-      await ch.track({ name: state.member?.name, host });
-      if (host) roomHostSend(true);
-      else { ch.send({ type: 'broadcast', event: 'hello', payload: {} }); roomPing(); }
-    }
-  });
-  clearInterval(room.pingTimer); clearInterval(room.sendTimer);
+  clearInterval(room.pingTimer); clearInterval(room.sendTimer); clearInterval(room.watchTimer);
   if (!host) {
     room.pingTimer = setInterval(roomPing, 4000);
     enginePauseLocal(); stopSources();
   } else room.sendTimer = setInterval(() => roomHostSend(false), 500);
+  room.watchTimer = setInterval(roomWatch, 1000);
+  await roomConnect();
   renderRoomBar(); renderTransport(); renderMixer(); wakeLockUpdate();
   if (!host) $('#mixer').hidden = true;
+}
+// (Re)build the realtime channel. Each build has its own number, so late messages or
+// status changes from an old channel are ignored.
+async function roomConnect() {
+  const gen = ++room.gen;
+  clearTimeout(room.reconnectTimer); room.reconnectTimer = 0;
+  const old = room.channel; room.channel = null;
+  if (old) { try { await db.removeChannel(old); } catch { /* gone */ } }
+  if (gen !== room.gen || !room.code) return;
+  const ch = db.channel(`cp-room-${room.code}`, { config: { broadcast: { self: false }, presence: { key: room.device } } });
+  room.channel = ch; room.status = 'joining'; room.connectAt = Date.now();
+  const on = (event, f) => ch.on('broadcast', { event }, ({ payload }) => { if (gen === room.gen) f(payload || {}); });
+  on('state', roomOnState);
+  // answered from the event itself (not a timer), so a host tab in the background still replies
+  on('ping', (p) => { if (room.host) { ch.send({ type: 'broadcast', event: 'pong', payload: { ...p, th: Date.now() } }); roomHostSend(true); } });
+  on('pong', roomOnPong);
+  on('cmd', roomOnCmd);
+  on('hello', () => roomHostSend(true));
+  on('bye', () => { if (room.following) { toast('The host ended the room.'); roomLeave(); } });
+  ch.on('presence', { event: 'sync' }, () => {
+    if (gen !== room.gen) return;
+    const ps = Object.values(ch.presenceState()).flat();
+    room.members = Object.keys(ch.presenceState()).length;
+    room.hostPresent = ps.some((m) => m.host);
+    room.presenceAt = Date.now();
+    renderRoomBar();
+  });
+  ch.subscribe(async (status) => {
+    if (gen !== room.gen) return;
+    room.status = status;
+    if (status === 'SUBSCRIBED') {
+      if (room.retry) anaEvent('room', { action: 'reconnected', code: room.code, role: room.host ? 'host' : 'follower', tries: room.retry });
+      room.retry = 0;
+      try { await ch.track({ name: state.member?.name, host: room.host }); } catch { /* presence is optional */ }
+      if (room.host) roomHostSend(true);
+      else { roomHello(); roomPing(); }
+    } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') roomScheduleReconnect();
+    renderRoomBar(); renderTransport();
+  });
+}
+function roomScheduleReconnect(now) {
+  if (!room.code || room.reconnectTimer) return;
+  const wait = now ? 0 : Math.min(10000, 1000 * 2 ** room.retry);
+  room.retry += 1;
+  room.status = 'reconnecting';
+  room.reconnectTimer = setTimeout(() => {
+    room.reconnectTimer = 0;
+    if (!room.code) return;
+    anaEvent('room', { action: 'reconnect', code: room.code, role: room.host ? 'host' : 'follower', try: room.retry, quiet_ms: room.lastHostSeen ? Date.now() - room.lastHostSeen : null });
+    roomConnect();
+  }, wait);
+  renderRoomBar(); renderTransport();
+}
+const roomJoined = () => room.channel?.state === 'joined';
+const roomStale = () => room.following && (!room.lastHostSeen || Date.now() - room.lastHostSeen > ROOM_STALE_MS);
+// Every second: notice a dead or silent channel and rebuild it; the host also checks for
+// the end of the song here, because the frame loop stops when its tab is in the background.
+function roomWatch() {
+  if (!room.code) return;
+  const now = Date.now();
+  const joined = roomJoined();
+  if (!joined && !room.reconnectTimer && now - room.connectAt > 8000) roomScheduleReconnect();
+  if (room.host) { checkSongEnd(); roomHostSend(false); }
+  else if (joined) {
+    const quiet = room.lastHostSeen ? now - room.lastHostSeen : now - room.connectAt;
+    if (quiet > 2500 && now - room.lastHello > 3000) roomHello();
+    // joined, the host is in the room, and still nothing arrives: the socket is half-dead
+    const hostThere = room.hostPresent || !room.presenceAt;
+    if (quiet > 9000 && hostThere && now - room.connectAt > 9000 && !room.reconnectTimer) roomScheduleReconnect();
+  }
+  renderRoomBar();
+  if (room.following || room.autoAt) renderTransport();
+}
+function roomHello() { room.lastHello = Date.now(); if (room.channel) room.channel.send({ type: 'broadcast', event: 'hello', payload: {} }); }
+// Back on screen / back online: check the room at once instead of waiting.
+function roomWake() {
+  if (!room.code) return;
+  if (!roomJoined()) { clearTimeout(room.reconnectTimer); room.reconnectTimer = 0; room.retry = 0; roomScheduleReconnect(true); }
+  else if (room.following) { roomHello(); roomPing(); }
+  else roomHostSend(true);
 }
 function enginePauseLocal() { pt.audio.pause(); if (pt.playing) { pt.offset = pt.ctx ? pt.offset + (pt.ctx.currentTime - pt.startAt) : pt.offset; stopSources(); pt.playing = false; } }
 async function roomLeave(silent) {
   if (room.code) anaEvent('room', { action: 'leave', code: room.code, role: room.host ? 'host' : 'follower', members: room.members, sync_ms: room.syncMs });
-  if (!room.channel) { room.code = null; room.following = false; sset('cp-room', null); renderRoomBar(); return; }
-  try { if (room.host) await room.channel.send({ type: 'broadcast', event: 'bye', payload: {} }); } catch { /* offline */ }
-  try { await db.removeChannel(room.channel); } catch { /* gone */ }
-  clearInterval(room.pingTimer); clearInterval(room.sendTimer);
-  const wasFollowing = room.following;
-  room.channel = null; room.code = null; room.host = false; room.following = false; room.anchor = null;
+  clearInterval(room.pingTimer); clearInterval(room.sendTimer); clearInterval(room.watchTimer); clearTimeout(room.reconnectTimer); room.reconnectTimer = 0;
+  roomCancelAuto(true);
+  room.gen += 1;
+  const ch = room.channel, wasHost = room.host, wasFollowing = room.following;
+  room.channel = null; room.code = null; room.host = false; room.following = false; room.anchor = null; room.status = ''; room.barKey = '';
   sset('cp-room', null);
+  if (ch) {
+    try { if (wasHost) await ch.send({ type: 'broadcast', event: 'bye', payload: {} }); } catch { /* offline */ }
+    try { await db.removeChannel(ch); } catch { /* gone */ }
+  }
   renderRoomBar(); renderTransport();
   if (wasFollowing && !silent && state.song) selectSong(state.song.slug, { quiet: true });
 }
@@ -1079,8 +1160,11 @@ function roomHostSend(force) {
   const now = Date.now();
   if (!force && now - room.lastSend < 450) return;
   room.lastSend = now;
+  const dur = songDuration();
+  const loading = engineMode() === 'multi' ? pt.tracks.some((t) => audible(t) && t.loading) : !hasMix();
   room.channel.send({ type: 'broadcast', event: 'state', payload: {
-    song: state.song.slug, pos: heardPosition(), at: now, playing: !!engineIsPlaying(), duration: songDuration(), host: state.member?.name,
+    song: state.song.slug, pos: Math.min(dur || Infinity, heardPosition()), at: now, playing: !!engineIsPlaying(), duration: dur, host: state.member?.name,
+    loading: !!loading && !engineIsPlaying(), auto_in: room.autoAt ? Math.max(0, room.autoAt - now) : 0,
   } });
 }
 function roomOnState(p) {
@@ -1088,16 +1172,19 @@ function roomOnState(p) {
   room.lastHostSeen = Date.now();
   room.hostName = p.host || '';
   const newSong = p.song !== state.song?.slug;
-  room.anchor = p;
+  room.anchor = { ...p, recv: room.lastHostSeen };
   if (newSong) selectSong(p.song, { fromRoom: true, quiet: true });
   renderTransport();
 }
+// The host's position now. Never runs on more than ROOM_STALE_MS past the last message,
+// so a lost connection freezes the lyrics instead of racing to the end of the song.
 function roomPosition() {
   const a = room.anchor; if (!a) return 0;
   if (!a.playing) return a.pos;
-  const hostNow = Date.now() + room.offset;
-  return Math.min(a.duration || Infinity, a.pos + (hostNow - a.at) / 1000);
+  const hostNow = Math.min(Date.now(), (a.recv || Date.now()) + ROOM_STALE_MS) + room.offset;
+  return Math.max(0, Math.min(a.duration || Infinity, a.pos + (hostNow - a.at) / 1000));
 }
+const roomIsPlaying = () => !!(room.anchor?.playing && !roomStale() && roomPosition() < (room.anchor.duration || Infinity) - 0.05);
 function roomPing() { if (room.channel && room.following) room.channel.send({ type: 'broadcast', event: 'ping', payload: { from: room.device, t0: Date.now() } }); }
 function roomOnPong(p) {
   if (p.from !== room.device) return;
@@ -1108,8 +1195,9 @@ function roomOnPong(p) {
   if (rtt <= room.bestRtt) { room.bestRtt = rtt; room.offset = room.syncMs == null ? off : room.offset + (off - room.offset) * 0.5; room.syncMs = Math.round(rtt / 2); }
 }
 function roomCmd(cmd, extra = {}) {
-  if (!room.channel) return;
+  if (!room.channel) { toast('Reconnecting to the room — try again in a moment.'); return; }
   room.channel.send({ type: 'broadcast', event: 'cmd', payload: { cmd, ...extra } });
+  if (!roomJoined()) roomWake();
 }
 function roomOnCmd(p) {
   if (!room.host) return;
@@ -1119,14 +1207,81 @@ function roomOnCmd(p) {
   else if (p.cmd === 'seek') engineSeek(Number(p.t) || 0);
   else if (p.cmd === 'song' && p.slug) selectSong(p.slug);
 }
+
+// ---- end of a song (host only): stay, go to the next song, or play the next song
+// The multitrack has no "ended" event, so this is checked every frame and every second.
+function checkSongEnd() {
+  if (room.following || !state.song) return;
+  if (engineMode() === 'multi' && pt.playing && enginePosition() >= songDuration() - 0.02) {
+    pt.playing = false; stopSources(); pt.offset = songDuration(); afterTransport(); songEnded();
+  }
+}
+async function songEnded() {
+  if (!room.host || !state.song) return;
+  const mode = room.endMode;
+  if (mode === 'stay') return;
+  const i = state.songs.findIndex((s) => s.slug === state.song.slug);
+  const last = i === state.songs.length - 1;
+  const next = state.songs[(i + 1) % state.songs.length]?.slug;
+  if (!next || next === state.song.slug) return;
+  anaEvent('room', { action: 'song_end', code: room.code, then: mode, next });
+  await selectSong(next, { quiet: true, auto: true });
+  // after the last song, go back to the first one but wait
+  if (mode === 'play' && !last && state.song?.slug === next) {
+    room.autoSong = next; room.autoAt = Date.now() + ROOM_AUTO_MS;
+    clearTimeout(room.autoTimer);
+    room.autoTimer = setTimeout(roomAutoPlay, ROOM_AUTO_MS);
+    roomHostSend(true); renderTransport();
+  }
+}
+async function roomAutoPlay() {
+  const slug = room.autoSong;
+  room.autoTimer = 0;
+  if (!room.autoAt || !room.host || state.song?.slug !== slug) { roomCancelAuto(true); return; }
+  if (engineMode() === 'multi') await waitTracksReady();
+  if (!room.autoAt || state.song?.slug !== slug) return;
+  room.autoAt = 0; room.autoSong = null;
+  enginePlay();
+}
+function roomCancelAuto(quiet) {
+  if (!room.autoAt && !room.autoTimer) return;
+  clearTimeout(room.autoTimer); room.autoTimer = 0; room.autoAt = 0; room.autoSong = null;
+  if (!quiet) { roomHostSend(true); renderTransport(); }
+}
+function roomStatusText() {
+  if (room.following) {
+    if (!roomJoined() || room.status === 'reconnecting') return 'Reconnecting to the room…';
+    if (room.presenceAt && !room.hostPresent && roomStale()) return 'Waiting for the host to come back…';
+    if (!room.lastHostSeen) return 'Waiting for the host…';
+    if (roomStale()) return 'Waiting for the host’s signal…';
+    const a = room.anchor;
+    const left = a?.auto_in ? Math.ceil((a.auto_in - (Date.now() - a.recv)) / 1000) : 0;
+    if (left > 0) return `${state.song?.name || 'Next song'} starts in ${left} s`;
+    if (a?.loading) return `${room.hostName || 'The host'} is loading the song…`;
+    return `Following ${room.hostName || 'the host'} · ${room.syncMs != null ? `synced ±${room.syncMs} ms` : 'syncing…'}`;
+  }
+  if (room.host) {
+    if (room.autoAt) return `${state.song?.name || 'Next song'} starts in ${Math.max(1, Math.ceil((room.autoAt - Date.now()) / 1000))} s · press ■ to stay here`;
+    if (!roomJoined()) return 'Room: reconnecting…';
+  }
+  return '';
+}
 function renderRoomBar() {
   const bar = $('#room-bar');
   $('#btn-room').classList.toggle('on', !!room.code);
-  if (!room.code) { bar.hidden = true; return; }
+  if (!room.code) { bar.hidden = true; room.barKey = ''; return; }
   bar.hidden = false;
-  bar.innerHTML = room.host
-    ? `<span>Group practice · room <span class="code">${esc(room.code)}</span> · you are playing the audio · ${room.members || 1} device${room.members === 1 ? '' : 's'}</span><span class="spacer"></span><button class="btn small" id="room-end">End room</button>`
-    : `<span>Following room <span class="code">${esc(room.code)}</span> · lyrics follow the host's playback</span><span class="spacer"></span><button class="btn small" id="room-end">Leave</button>`;
+  const conn = !roomJoined() ? ' · <b class="warn">reconnecting…</b>' : '';
+  const devices = `${room.members || 1} device${(room.members || 1) === 1 ? '' : 's'}`;
+  const ends = [['stay', 'Stay on this song'], ['next', 'Go to the next song'], ['play', 'Play the next song']];
+  const html = room.host
+    ? `<span>Group practice · room <span class="code">${esc(room.code)}</span> · you are playing the audio · ${devices}${conn}</span><span class="spacer"></span>
+       <label class="small room-end-mode">When a song ends <select id="room-endmode">${ends.map(([v, l]) => `<option value="${v}"${room.endMode === v ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
+       <button class="btn small" id="room-end">End room</button>`
+    : `<span>Following room <span class="code">${esc(room.code)}</span> · lyrics follow the host's playback${conn}</span><span class="spacer"></span><button class="btn small" id="room-end">Leave</button>`;
+  if (html === room.barKey) return;          // re-drawn only when something changed
+  room.barKey = html;
+  bar.innerHTML = html;
 }
 function roomDialog() {
   const d = $('#dlg');
@@ -1220,6 +1375,12 @@ function wireStatic() {
   $('#btn-fs').addEventListener('click', () => toggleFs());
   $('#btn-room').addEventListener('click', roomDialog);
   $('#room-bar').addEventListener('click', (e) => { if (e.target.id === 'room-end') roomLeave(); });
+  $('#room-bar').addEventListener('change', (e) => {
+    if (e.target.id !== 'room-endmode') return;
+    room.endMode = e.target.value; lset('cp-room-end', room.endMode);
+    if (room.endMode !== 'play') roomCancelAuto();
+    anaEvent('room', { action: 'end_mode', code: room.code, mode: room.endMode });
+  });
   // Only a real mouse movement brings the full-screen controls back: browsers also fire
   // mousemove when the lyrics scroll under a pointer that is not moving (every new line).
   document.addEventListener('mousemove', (e) => { if (e.movementX || e.movementY) fsPoke(); }, { passive: true });
@@ -1285,7 +1446,7 @@ function wireStatic() {
   });
   document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && document.body.classList.contains('fs')) toggleFs(false); });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') { wakeLockUpdate(); if (pt.ctx?.state === 'suspended' && pt.playing) pt.ctx.resume(); if (room.following) roomPing(); }
+    if (document.visibilityState === 'visible') { wakeLockUpdate(); if (pt.ctx?.state === 'suspended' && pt.playing) pt.ctx.resume(); roomWake(); }
   });
   requestAnimationFrame(tick);
 }
