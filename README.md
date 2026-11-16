@@ -6,7 +6,7 @@ A small practice player for Caroline's students, cloned from the TSP Work band a
 - **Ableton Sync** (admin only): read the `.als` (songs from **locators** — no Song IDs; lyrics from every `+LYRICS` track; sections from `SECTIONS`; tempo/key), and upload the exported audio (files are matched to song and track by name; WAV is converted to MP3 in the browser; silent tracks are skipped).
 
 ## How it is built
-- Static site (`index.html`, `app.js`, `als.js`, `styles.css`) on GitHub Pages; no build step.
+- Static site (`index.html`, `app.js`, `als.js`, `styles.css`) on GitHub Pages, served from the **gh-pages** branch (push `main` to `gh-pages` to publish: `git push origin main:gh-pages`); no build step. Live at https://aaronmark2222.github.io/caroline-practice/
 - **Supabase** project `hzvfrvjuqvmkeqbrgmqu` (shared with TSP Work, tables prefixed `cp_`): `cp_users` (who may sign in; role `admin`/`teacher`), `cp_songs` (one row per locator song, with lyrics JSON), `cp_meta` (`set`: the exportable tracks read from the set). RLS: members read, admin writes. Schema in `supabase/migrations/`.
 - **Edge Function** `caroline-audio` (`supabase/functions/caroline-audio/`): signed R2 links (list, urls, upload, finalize, delete). R2 keys are the project's existing Edge Function secrets.
 - **Cloudflare R2**: bucket `tsp-practice`, prefix `caroline/<song>/<track>.<mp3|m4a|wav>` (TSP Work only lists `songs/`, so the two never mix).
