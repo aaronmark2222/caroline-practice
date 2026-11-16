@@ -14,4 +14,7 @@ A small practice player for Caroline's students, cloned from the TSP Work band a
 - `vendor/lamejs.js`: MP3 encoder (LGPL, see `vendor/LICENSE`).
 
 ## Adding a sign-in
-Usernames map to `<username>@example.com`. Ask Claude (or run SQL as the admin) to create an auth user and a `cp_users` row.
+
+Master plan and resume checklist: `APP_PLAN.md`. Working rules: `AGENTS.md`.
+
+Usernames map to `<username>@example.com`. See `APP_PLAN.md` §8 to add a sign-in; sign-ins are recorded only in the Mac folder's git-ignored `private/` folder.

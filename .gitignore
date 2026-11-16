@@ -1,3 +1,4 @@
 tools/node_modules/
-.DS_Store
 tools/
+private/
+.DS_Store
