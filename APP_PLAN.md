@@ -1,8 +1,8 @@
 # Caroline Practice — App Plan (master document)
 
-_Last reconciled: **2026-11-16** · cache markers `app.js?v=20261116-6`, `styles.css?v=20261116-7`, `sw.js`, `als.js?v=20261116-1` · Supabase migration `caroline_practice_init` · Edge Function `caroline-audio` **v2** · Ableton control surface **CarolineSync 1.0** · published from branch `gh-pages`._
+_Last reconciled: **2026-11-17** (Update App Plan) · cache markers `app.js?v=20261117-1`, `styles.css?v=20261116-7`, `als.js?v=20261116-1`, `sw.js` (cache `cp-app-shell-v1`) · repo `main` = `gh-pages` · Supabase migrations `20261116151128_caroline_practice_init`, `20261116185752_caroline_practice_analytics` (files in `supabase/migrations/` under the live versions) · Edge Function `caroline-audio` **v2** (deployed source = repo) · Ableton control surface **CarolineSync 1.0** (installed files = repo, md5 checked) · Mac folder clone = GitHub._
 
-The single source of truth for resuming work on **Caroline Practice**, a side project of the TSP Band App (TSP Work). Read sections 0–4 before changing anything. Live code and databases win over this file; this file wins over memory.
+The single source of truth for resuming work on **Caroline Practice**. It started as a side project inside the claude.ai Project "TSP Band App" and moved to its own claude.ai Project on 17 Nov 2026; it still shares the TSP Band App's Supabase project and R2 bucket (see §2), but its code, docs and Ableton bridge are separate and the band app must never be edited for it. Read sections 0–4 before changing anything. Live code and databases win over this file; this file wins over memory.
 
 ---
 
@@ -18,7 +18,7 @@ The single source of truth for resuming work on **Caroline Practice**, a side pr
 2. Compare the live Supabase `cp_` schema and migrations with `supabase/migrations/`; save any missing SQL.
 3. Compare the deployed `caroline-audio` source (`get_edge_function`) with `supabase/functions/caroline-audio/index.ts`.
 4. Pull the Mac clone so it matches GitHub.
-5. Update this file (header, changed sections, decision log, known issues, changelog), commit "Update App Plan (<date>)", push, publish, and copy it to the claude.ai Project doc `claude/CAROLINE_APP_PLAN.md`.
+5. Update this file (header, changed sections, decision log, known issues, changelog), commit "Update App Plan (<date>)", push, publish, and copy it to the Caroline Practice claude.ai Project as `claude/APP_PLAN.md` (a copy may also exist in the TSP Band App Project as `claude/CAROLINE_APP_PLAN.md`; the Caroline Project's copy is the one to keep current).
 6. Tell Aaron in a few lines what changed.
 
 ---
@@ -28,7 +28,9 @@ The single source of truth for resuming work on **Caroline Practice**, a side pr
 A practice player for **Caroline**'s students, who are performing three songs at their **annual day**. Aaron (bassist / playback engineer of The String Project) built the Ableton practice project and is the admin. It is a deliberately cut-down clone of TSP Work: **no Song IDs, tasks, setlists, gigs or member tracker** — only:
 
 1. **Practice** (everyone signed in): Mixdown or Multitrack playback with AbleSet-style lyrics, and **Group practice rooms** so one device plays the audio while other devices follow the lyrics in step.
-2. **Ableton Sync** (admin only): read the `.als`, upload the exported audio.
+2. **Ableton Sync** (admin only): read the `.als`, export and upload the audio (CarolineSync), upload by hand, and the **Usage** report.
+
+**Real-world use:** Caroline uses it to teach her students for about two weeks from 17 Nov 2026 (annual day). Usage analytics (§5, §6) record everything for performance and error troubleshooting.
 
 Users: **Aaron** (admin, signs in with his TSP Work email/password) and **Caroline** (teacher, username `caroline`; she uses one sign-in on many devices). Students do not have accounts; they use Caroline's devices or a room.
 
@@ -38,7 +40,7 @@ Users: **Aaron** (admin, signs in with his TSP Work email/password) and **Caroli
 GitHub (public) aaronmark2222/caroline-practice ── gh-pages ──► https://aaronmark2222.github.io/caroline-practice/
                                                                        │  browser
 Supabase hzvfrvjuqvmkeqbrgmqu (shared with TSP Work) ◄── Auth + PostgREST (RLS) ──┤
-   tables cp_users, cp_songs, cp_meta                                             │
+   tables cp_users, cp_songs, cp_meta, cp_sessions, cp_plays, cp_events (+ views cp_usage_*)                                            │
    Edge Fn caroline-audio (R2 keys = project secrets) ──presigned URLs──►         │◄── audio GET/PUT ── Cloudflare R2 bucket tsp-practice, prefix caroline/
    Realtime broadcast channels cp-room-<CODE> (group practice)                     │
 Ableton set: /Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als ── read in the browser on the Sync page (als.js)
@@ -63,6 +65,7 @@ Sync page (Aaron's Mac) ──fetch https://127.0.0.1:47721──► CarolineSyn
 | Edge Function | `caroline-audio` (verify_jwt on): `list`, `urls {song}`, `upload {song, element, ext}` (admin), `finalize` (admin; removes other formats), `delete` (admin), `upload_batch {songs, elements}` (admin; 24 h PUT/DEL links for CarolineSync) |
 | CarolineSync | `~/Music/Ableton/User Library/Remote Scripts/CarolineSync/` (`__init__.py`, `carolinesync.py`, `exporter.py` = a copy of TSPWork's exporter plus `CarolineExportJob`; `carolinesync-localhost.crt/.key` = copies of TSPWork's trusted 127.0.0.1 certificate, never committed). Selected in an empty Control Surface slot in Live (Input/Output None) next to TSPWork. HTTP 127.0.0.1:47720, HTTPS :47721; origins GitHub Pages + localhost:8000; every POST needs the admin's Supabase token (checked with `rpc/cp_is_admin`); exports only while `/Users/aaron/Desktop/CAROLINE/Caroline Project/Caroline.als` is the open set and Live is stopped; uploads only to `caroline/`. Endpoints: GET `/status`; POST `/export`, `/export/state`, `/export/cancel` (`{after_song:true}`) |
 | R2 | bucket `tsp-practice`, keys `caroline/<song-slug>/<element-slug>.<mp3|m4a|wav>`; CORS already allows the GitHub Pages origin |
+| Device IDs | `localStorage['cp-device-id']` (one per browser on a device, kept until site data is cleared); optional name `cp-device-name` (account menu › Name this device) |
 | Usernames | `<username>` → `<username>@example.com` in Supabase Auth (no real email; no public sign-up) |
 
 ## 4. Standing rules
@@ -82,7 +85,12 @@ Sync page (Aaron's Mac) ──fetch https://127.0.0.1:47721──► CarolineSyn
 | `cp_songs` | `slug` (from the locator name), `name` (Title Case), `position`, `start_beat`, `end_beat`, `duration_seconds`, `bpm`, `song_key`, `lyrics` jsonb `{tracks:[{slug,label,color,lines:[{t,e,text,c}]}], sections:[{t,name,c}], tempo:[[sec,bpm]], keys:[{t,key}], sig:[num,den]}`, `hidden` (song no longer in the set) |
 | `cp_meta` | `set` → `{elements:[{slug,name,label,group,kind,color}], als_name, read_at}` |
 
-Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated only). Schema: `supabase/migrations/20261116_caroline_practice_init.sql`.
+| `cp_sessions` | one row per app session per device: `id` (client uuid), `user_id`, `device_id`, `device` (name or model), `os`, `browser`, `standalone` (home-screen app), `screen`, `app_version`, `info` (ua, language, time zone, cores, memory, connection, viewport…), `started_at`, `last_seen_at`, `active_seconds` (visible time), `view_seconds` (`practice`/`sync`/`fullscreen`), `offline`. A new session starts after 5 min away |
+| `cp_plays` | one row per stretch of practice of one song in one mode (mix / multi / follow) and room role: `seconds_played` (real playing time), `start_pos`, `end_pos`, `max_pos`, `song_seconds`, `reached_end`, `seeks`, `pauses`, `fullscreen_seconds`, `lyrics_track`, `mixer` (multitrack on/solo/vol), `room_role`, `room_code`, `offline`. Kept across pauses under 5 min |
+| `cp_events` | `kind` + `detail`: `open`, `open_offline`, `signin`, `signout`, `js_error` (message, file, line, stack), `audio_error` (track, error), `audio_list_error`, `play_blocked`, `audio_output` (outputLatency, baseLatency, sampleRate — once per session), `mode`, `room` (create/join/leave, members, sync_ms), `offline_save`, `offline_clear`, `upload`, `export` |
+| views `cp_usage_daily`, `cp_usage_devices`, `cp_usage_songs` | security-invoker summaries (IST days): sessions, devices, app-open minutes, practice minutes, plays (≥30 s), played to the end, mixdown/multitrack/room minutes, errors per device |
+
+Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated only). Analytics RLS: a signed-in member inserts/updates/reads only rows with their own `user_id`; the admin reads all. Schema: `supabase/migrations/20261116151128_caroline_practice_init.sql`, `20261116185752_caroline_practice_analytics.sql`.
 
 ## 6. Frontend
 
@@ -98,6 +106,8 @@ Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated onl
   - `sw.js` service worker (scope `/caroline-practice/`, cache `cp-app-shell-v1`): network-first for the app's own files, cache-first for esm.sh; the page also adds what it is running to that cache, so the first visit already works offline.
   - Data: last loaded user, songs, set and audio list in `localStorage['cp-data-cache-v1']`; with no connection (or an expired sign-in while offline) the app opens from it, with a yellow banner.
   - **Offline audio card** (Practice page, always on): every file played is saved in Cache Storage `cp-practice-audio-v1` (keys `https://cp-offline.local/<song>/<track>`) with a manifest `localStorage['cp-offline-manifest-v1']` (version = bytes|upload time). Saved copies are used when current, or always when offline; files opened in a visit also stay in memory (`memBlobs`, 200 MB phone / 600 MB computer). Buttons: Save all Mixdowns, Save everything, Update (newer uploads), Stop, Delete saved audio. Counts: Mixdowns saved of available, full multitracks, files and MB. The Mixdown plays from the saved copy when there is one; otherwise it streams at once and a copy is saved in the background. `navigator.storage.persist()` is requested. Not ported: TSP's "save to a folder" mode (Chrome on a computer).
+- **Usage analytics (17 Nov 2026):** `ana*` functions in `app.js`. Rows are built on the device and queued in `localStorage['cp-analytics-queue-v1']` (max 800, newest kept), sent with `upsert` every 15 s, when the tab is hidden, on `online`, and at sign-out; rows of another sign-in are never sent; rows refused for a rule/data error are dropped, network errors are retried. Full rows are always sent (supabase-js nulls missing columns). Plays are measured every frame from real playing time; seeks and pauses are counted. Errors are caught with `window.onerror` / `unhandledrejection`.
+- **Usage report** (Ableton Sync, admin): totals for 3 weeks; by day, by song, by device (with errors), latest plays, problems (errors, blocked play), Refresh, and **Download all data (CSV)** (`cp_sessions`, `cp_plays`, `cp_events`).
 - **Group practice:** `Make a room` → 4-character code; host broadcasts `{song,pos,at,playing,duration}` every 500 ms on `cp-room-<CODE>`; followers measure the clock offset by ping/pong (shortest round trip wins), show `synced ±N ms`, hold no audio, and send commands (play/pause/stop/seek/song) the host applies. Host leaving ends the room. The green room bar is hidden in full screen (the transport's status line still says who you follow).
 - **Ableton Sync (admin) — Export from Ableton:** the same workflow as TSP Work's export: tick songs (Select all / Clear; uploaded songs in green), export folder (default `~/Desktop/CAROLINE/Caroline Exports`), Upload checkbox, Start → `upload_batch` links → CarolineSync `/export`; progress polled every 3 s; Stop after this song / Cancel; songs that exported fine are unticked; the audio list refreshes at the end. Per song it renders every STEMS/CPC/PARTS track that has clips in the song on its own (soloed), plus a **Mixdown = those tracks that are not muted in the set** (so the Mixdown is what Aaron hears with his current mutes). The song's locator must still be at its saved position, or the song is refused (read the set again). Files are named `<Song> - <Track>.mp3` in a folder per song; uploads are AAC 128 `.m4a`; an older `.mp3` of the same track is deleted; tracks a song no longer has are removed. Live's Export dialog must be set once to Rendered Track **Main**, MP3 on (as for TSPWork).
 - **Ableton Sync (admin):** Read set (.als parsed in the browser: gunzip + DOMParser) → preview → Save (upserts songs, hides songs no longer present, saves elements). Practice audio grid per song with delete. Upload exports: drop files/folder; song matched by name in the file name, track by the trailing track name (`Main`/`Master`/`Mixdown` → Mixdown); dropdowns to correct; WAV/AIFF converted to MP3 192 kbps; silent files skipped; length checked against the set (±1.5 s); PUT to presigned R2 URL with progress, then `finalize`.
@@ -114,6 +124,7 @@ Functions `cp_is_member()`, `cp_is_admin()` (security definer, authenticated onl
 
 - **Frontend change:** edit → `cp app.js /tmp/a.mjs && node --check /tmp/a.mjs` → bump `?v=` → commit → `git push origin main && git push origin main:gh-pages` → pull the Mac clone → check the live site.
 - **Add a sign-in:** SQL as in the migration notes: insert into `auth.users` (bcrypt via `extensions.crypt`) and `auth.identities`, then `cp_users`; record it in the Mac `private/ACCESS.md`.
+- **Read the analytics with SQL:** `select * from cp_usage_daily order by day desc;` · `select * from cp_usage_devices;` · `select * from cp_usage_songs;` · errors: `select at, kind, device_id, song_slug, detail from cp_events where kind like '%error%' or kind = 'play_blocked' order by at desc;` · a device's day: `select * from cp_plays where device_id = '…' order by started_at;`. Times are UTC in the tables; the views use IST days.
 - **Reset Caroline's password:** `update auth.users set encrypted_password = extensions.crypt('<new>', extensions.gen_salt('bf')) where email = 'caroline@example.com';` (or she changes it in the app).
 - **New set version:** Aaron uses Ableton Sync → Read set → Save; re-export and upload changed songs.
 
@@ -125,17 +136,22 @@ Headless Chrome (Playwright) with a fake supabase-js module (routes esm.sh) and 
 
 ## 10. Known issues / not yet checked
 
-- Real sign-in, real Supabase reads and the R2 upload have not yet been run end to end by a person (the Claude workspace cannot reach Supabase).
-- No practice audio uploaded yet. First real CarolineSync export not yet run; Live's Export dialog settings (Main, MP3) are assumed to carry over from the band set.
+- The Claude cloud workspace cannot reach Supabase or esm.sh directly (proxy); test with the headless harness (§9) and the built-in browser on Aaron's Mac. Aaron has signed in, read the set and exported/uploaded all three songs with CarolineSync (16 Nov).
+- Analytics just went live (17 Nov); first real rows not yet checked. Ask Caroline to name each device (account menu › Name this device) so the report is readable.
+- Multiple rooms at once: estimated 5–6 rooms of ~5 devices within the Free plan's 100 realtime messages/s (shared with TSP Work); untested. Rooms could be made ~2x lighter if needed.
+- The bar counter / latency fix awaits Aaron's answers (headphones, browser); `audio_output` events now record each device's latency.
 - iPhone memory with many long multitrack tracks is untested; phones decode at 24 kHz and only audible tracks.
 
 ## 11. Decision log
+
+- **2026-11-17:** Caroline uses the app with students for ~2 weeks; Aaron wants as much usage data as possible (sessions per device, run time, practice times, counts, errors). Built `cp_sessions` / `cp_plays` / `cp_events` + Usage report + CSV export. App development moves to its own claude.ai Project.
 
 - **2026-11-16 (evening):** Aaron wants the TSP-style exporter (select songs, export and upload from the Sync page). First attempt put a Caroline profile inside TSPWork 1.34; Aaron said never to edit the band app, so it was reverted the same minute (band repo commit `54f3b58` restores TSPWork 1.33 byte-for-byte; the installed TSPWork files were restored to their originals). Built instead as the separate **CarolineSync** control surface in this repo. Mixdown = the exported tracks that are not muted in the set.
 - **2026-11-16:** Built as a separate public repo with Pages from `gh-pages`; shares TSP's Supabase project (so the existing R2 secrets work) with `cp_` tables and its own Edge Function; R2 under `caroline/` in the same bucket; songs from locators only; Aaron admin with his TSP login, Caroline as username `caroline`; Mac folder is a clone with a git-ignored `private/`.
 
 ## 12. Changelog of this plan
 
+- **2026-11-17:** Update App Plan: analytics added; migrations saved under their live versions; function, CarolineSync and Mac clone verified; plan prepared for the move to the new Project.
 - **2026-11-16:** Created.
 - **2026-11-16:** Added CarolineSync (Export from Ableton) and `upload_batch`.
 - **2026-11-16:** Page could not be scrolled past the lyrics (the box grew as the page scrolled, and scroll chaining was blocked); fixed, measured on desktop and phone sizes.

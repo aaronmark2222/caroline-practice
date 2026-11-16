@@ -67,6 +67,7 @@ async function signIn(e) {
   if (error) { $('#si-msg').textContent = /invalid/i.test(error.message) ? 'That username or password is not right.' : error.message; return; }
   $('#si-pass').value = '';
   await enter(data.user);
+  anaEvent('signin', { username: u.includes('@') ? 'email' : u.toLowerCase() });
 }
 
 async function enter(user) {
@@ -86,6 +87,8 @@ async function enter(user) {
   $$('.admin-only').forEach((b) => { b.hidden = member.role !== 'admin'; });
   $('#signin').hidden = true; $('#boot').hidden = true; $('#app').hidden = false;
   dataCachePut({ member });
+  anaSessionStart();
+  anaEvent(state.offline ? 'open_offline' : 'open', { role: member.role });
   await loadData();
   renderOfflineBanner();
   setView(member.role === 'admin' && lget('cp-view', 'practice') === 'sync' ? 'sync' : 'practice');
@@ -96,6 +99,7 @@ async function enter(user) {
 }
 
 async function signOut() {
+  anaEvent('signout'); anaPlayClose(); anaHeartbeat('noflush'); await aqFlush();
   await roomLeave();
   enginePause();
   await db.auth.signOut();
@@ -288,12 +292,14 @@ async function offlineDownload(slugs, { everything, onlyUpdates } = {}) {
     }
   }
   offline.job = null;
+  anaEvent('offline_save', { files: job.done - job.failed, failed: job.failed, bytes: job.bytes, cancelled: job.cancelled, everything: !!everything, updates: !!onlyUpdates }, null);
   toast(job.cancelled ? 'Stopped saving audio.' : `Saved ${job.done - job.failed} file${job.done - job.failed === 1 ? '' : 's'} on this device${job.failed ? ` (${job.failed} failed — try again on a better connection)` : ''}.`);
   renderOfflinePanel(); renderSongChips();
 }
 async function offlineClear() {
   if (!confirm('Delete the practice audio saved on this device? It saves again as songs are played.')) return;
   try { await caches.delete(OFFLINE_CACHE); } catch { /* ignore */ }
+  anaEvent('offline_clear', offlineStats(), null);
   offline.manifest = {}; offlineSaveManifest(); memBlobs.clear();
   renderOfflinePanel(); renderSongChips();
 }
@@ -321,6 +327,159 @@ function renderOfflineBanner() {
   const off = state.offline || !navigator.onLine;
   const b = $('#offline-banner'); if (b) b.hidden = !off;
 }
+
+// ------------------------------------------------------------------ usage analytics
+// Every device records its sessions (time open, per page), practice plays (song, mode,
+// seconds actually playing, seeks, pauses, played to the end, full screen, room role,
+// mixer) and events (errors, audio problems, rooms, offline saves, uploads, exports).
+// Rows are kept in a queue on the device first, so nothing is lost offline or when a
+// tab is closed; they are sent every 15 s and when the connection returns. Only the
+// admin can read everyone's rows (Ableton Sync › Usage).
+const APP_VERSION = '20261117-1';
+const AQ_KEY = 'cp-analytics-queue-v1';
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
+const ana = {
+  deviceId: lget('cp-device-id', null) || uuid(), session: null, play: null, queue: lget(AQ_KEY, []),
+  flushing: false, lastBeat: 0, hiddenAt: 0, lastTick: 0, pausedAt: 0, latencyLogged: false,
+};
+lset('cp-device-id', ana.deviceId);
+function deviceInfo() {
+  const ua = navigator.userAgent;
+  const ipad = /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const model = /iPhone/.test(ua) ? 'iPhone' : ipad ? 'iPad' : /Android/.test(ua) ? (/Mobile/.test(ua) ? 'Android phone' : 'Android tablet')
+    : /Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows PC' : /CrOS/.test(ua) ? 'Chromebook' : /Linux/.test(ua) ? 'Linux' : 'Other';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Other';
+  const os = (/OS (\d+[_.]\d+)/.exec(ua)?.[1] && (ipad || /iPhone/.test(ua)) ? 'iOS ' + /OS (\d+[_.]\d+)/.exec(ua)[1].replace('_', '.')
+    : /Android ([\d.]+)/.exec(ua) ? 'Android ' + /Android ([\d.]+)/.exec(ua)[1]
+    : /Mac OS X ([\d_]+)/.exec(ua) ? 'macOS' : /Windows NT ([\d.]+)/.exec(ua) ? 'Windows' : '');
+  const name = lget('cp-device-name', '');
+  return {
+    device: name ? `${name} (${model})` : model, os, browser,
+    standalone: !!(window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone),
+    screen: `${screen.width}x${screen.height}@${window.devicePixelRatio || 1}`,
+    info: { ua, name, lang: navigator.language, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, cores: navigator.hardwareConcurrency || null,
+      memory_gb: navigator.deviceMemory || null, connection: navigator.connection?.effectiveType || null, touch: navigator.maxTouchPoints || 0,
+      viewport: `${innerWidth}x${innerHeight}` },
+  };
+}
+function aqPut(table, row) {
+  row = Object.fromEntries(Object.entries(row).filter(([k]) => !k.startsWith('_')));   // local-only fields stay local
+  const i = ana.queue.findIndex((q) => q.t === table && q.r.id === row.id);
+  if (i >= 0) ana.queue[i].r = { ...row }; else ana.queue.push({ t: table, r: { ...row } });
+  if (ana.queue.length > 800) ana.queue.splice(0, ana.queue.length - 800);
+  lset(AQ_KEY, ana.queue);
+}
+async function aqFlush() {
+  if (ana.flushing || !ana.queue.length || !navigator.onLine || !state.user) return;
+  ana.flushing = true;
+  try {
+    ana.queue = ana.queue.filter((q) => q.r.user_id === state.user.id);   // never send another sign-in's rows
+    const batch = ana.queue.slice(0, 120);
+    const sent = new Set();
+    for (const t of ['cp_sessions', 'cp_plays', 'cp_events']) {
+      const items = batch.filter((q) => q.t === t);
+      if (!items.length) continue;
+      const { error } = await db.from(t).upsert(items.map((q) => q.r), { onConflict: 'id', returning: 'minimal' });
+      if (error) {
+        // a rule or data problem would block the queue for ever: drop those rows; keep them on network trouble
+        if (/^(42|23|22|PGRST)/.test(error.code || '')) { items.forEach((q) => sent.add(q)); console.warn('analytics dropped', t, error); }
+        else throw error;
+      } else items.forEach((q) => sent.add(q));
+    }
+    ana.queue = ana.queue.filter((q) => !sent.has(q));
+    lset(AQ_KEY, ana.queue);
+  } catch (e) { console.warn('analytics', e); }
+  finally { ana.flushing = false; }
+}
+function anaSessionStart() {
+  if (!state.user) return;
+  const d = deviceInfo();
+  ana.session = { id: uuid(), user_id: state.user.id, device_id: ana.deviceId, device: d.device, os: d.os, browser: d.browser, standalone: d.standalone,
+    screen: d.screen, app_version: APP_VERSION, info: d.info, started_at: new Date().toISOString(), last_seen_at: new Date().toISOString(),
+    active_seconds: 0, view_seconds: {}, offline: !!state.offline };
+  ana.lastBeat = Date.now();
+  aqPut('cp_sessions', ana.session);
+}
+function anaHeartbeat(force) {
+  const s = ana.session; if (!s) return;
+  const now = Date.now();
+  if (document.visibilityState === 'visible') {
+    const dt = Math.min(60, (now - ana.lastBeat) / 1000);
+    s.active_seconds = Math.round(s.active_seconds + dt);
+    const v = document.body.classList.contains('fs') ? 'fullscreen' : state.view;
+    s.view_seconds = { ...s.view_seconds, [v]: Math.round((s.view_seconds[v] || 0) + dt) };
+  }
+  ana.lastBeat = now;
+  s.last_seen_at = new Date().toISOString();
+  s.offline = s.offline || !!state.offline || !navigator.onLine;
+  aqPut('cp_sessions', s);
+  if (ana.play) aqPut('cp_plays', ana.play);
+  if (force !== 'noflush') aqFlush();
+}
+function anaEvent(kind, detail = {}, song = state.song?.slug || null) {
+  if (!state.user) return;
+  aqPut('cp_events', { id: uuid(), session_id: ana.session?.id || null, user_id: state.user.id, device_id: ana.deviceId,
+    at: new Date().toISOString(), kind, song_slug: song, detail });
+}
+function anaMixer() {
+  const out = {};
+  for (const t of pt.tracks) { const m = mixerSetting(t.slug, t.kind); out[t.slug] = { on: m.on, solo: m.solo, vol: m.vol }; }
+  return out;
+}
+function anaPlayClose() {
+  const p = ana.play; if (!p) return;
+  p.updated_at = new Date().toISOString();
+  if (p.mode === 'multi') p.mixer = anaMixer();
+  aqPut('cp_plays', p);
+  ana.play = null;
+}
+// Called every frame: accumulates real playing time on the open play.
+function anaTick() {
+  const now = performance.now();
+  const dt = ana.lastTick ? Math.min(0.5, (now - ana.lastTick) / 1000) : 0;
+  ana.lastTick = now;
+  if (!state.song || !state.user || !ana.session) return;
+  const playing = !!engineIsPlaying();
+  const mode = room.following ? 'follow' : engineMode();
+  const role = room.code ? (room.host ? 'host' : 'follower') : null;
+  const key = `${state.song.slug}|${mode}|${role || ''}|${room.code || ''}`;
+  if (playing) {
+    if (!ana.play || ana.play._key !== key || (ana.pausedAt && Date.now() - ana.pausedAt > 5 * 60e3)) {
+      anaPlayClose();
+      const pos = heardPosition();
+      ana.play = { _key: key, id: uuid(), session_id: ana.session.id, user_id: state.user.id, device_id: ana.deviceId, song_slug: state.song.slug,
+        mode, room_role: role, room_code: room.code || null, started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        seconds_played: 0, start_pos: +pos.toFixed(2), end_pos: +pos.toFixed(2), max_pos: +pos.toFixed(2),
+        song_seconds: +(room.following ? (room.anchor?.duration || state.song.duration_seconds) : songDuration()).toFixed(2),
+        reached_end: false, seeks: 0, pauses: 0, fullscreen_seconds: 0, lyrics_track: lget('cp-ly-track', 'lyrics'), mixer: null, offline: !!state.offline || !navigator.onLine };
+    }
+    ana.pausedAt = 0;
+    const p = ana.play, pos = heardPosition();
+    p.seconds_played = +(p.seconds_played + dt).toFixed(2);
+    if (document.body.classList.contains('fs')) p.fullscreen_seconds = +(p.fullscreen_seconds + dt).toFixed(2);
+    p.end_pos = +pos.toFixed(2);
+    p.max_pos = +Math.max(p.max_pos, pos).toFixed(2);
+    if (p.song_seconds && pos >= p.song_seconds - 1.5) p.reached_end = true;
+  } else if (ana.play && !ana.pausedAt) ana.pausedAt = Date.now();
+  if (!ana.latencyLogged && pt.ctx?.state === 'running') {
+    ana.latencyLogged = true;
+    anaEvent('audio_output', { outputLatency: pt.ctx.outputLatency ?? null, baseLatency: pt.ctx.baseLatency ?? null, sampleRate: pt.ctx.sampleRate });
+  }
+}
+function anaCount(field) { if (ana.play) ana.play[field] = (ana.play[field] || 0) + 1; }
+window.addEventListener('error', (e) => anaEvent('js_error', { message: String(e.message || '').slice(0, 500), source: String(e.filename || '').split('/').pop(), line: e.lineno, col: e.colno, stack: String(e.error?.stack || '').slice(0, 1500) }));
+window.addEventListener('unhandledrejection', (e) => anaEvent('js_error', { message: String(e.reason?.message || e.reason || '').slice(0, 500), stack: String(e.reason?.stack || '').slice(0, 1500), promise: true }));
+document.addEventListener('visibilitychange', () => {
+  if (!state.user) return;
+  if (document.visibilityState === 'hidden') { anaHeartbeat('noflush'); ana.hiddenAt = Date.now(); aqFlush(); }
+  else {
+    if (ana.hiddenAt && Date.now() - ana.hiddenAt > 5 * 60e3) { anaPlayClose(); anaHeartbeat('noflush'); anaSessionStart(); }   // away > 5 min: new session
+    ana.lastBeat = Date.now(); ana.hiddenAt = 0;
+  }
+});
+window.addEventListener('pagehide', () => { anaPlayClose(); anaHeartbeat('noflush'); });
+setInterval(() => { if (state.user) anaHeartbeat(); }, 15000);
+window.addEventListener('online', () => setTimeout(aqFlush, 2000));
 
 // ------------------------------------------------------------------ engine
 // One transport, two engines: the Mixdown streams through a single <audio>
@@ -405,7 +564,7 @@ async function enginePlay() {
     if (!pt.audio.src) return;
     if (pt.audio.ended || pt.audio.currentTime >= songDuration() - 0.05) pt.audio.currentTime = 0;
     try { const c = ensureCtx(); if (c.state !== 'running') c.resume(); } catch { /* latency stays 0 */ }
-    try { await pt.audio.play(); } catch (e) { toast('Tap play again to start audio.'); console.warn(e); }
+    try { await pt.audio.play(); } catch (e) { toast('Tap play again to start audio.'); console.warn(e); anaEvent('play_blocked', { error: String(e?.name || e) }); }
   } else {
     const ctx = ensureCtx();
     if (ctx.state !== 'running') await ctx.resume();
@@ -418,12 +577,14 @@ async function enginePlay() {
   afterTransport();
 }
 function enginePause() {
+  if (engineIsPlaying()) anaCount('pauses');
   if (room.following) return roomCmd('pause');
   if (engineMode() === 'mix') pt.audio.pause();
   else if (pt.playing) { pt.offset = enginePosition(); stopSources(); pt.playing = false; }
   afterTransport();
 }
 function engineSeek(sec) {
+  anaCount('seeks');
   if (room.following) return roomCmd('seek', { t: sec });
   sec = Math.max(0, Math.min(sec, songDuration()));
   if (engineMode() === 'mix') { try { pt.audio.currentTime = sec; } catch { /* not loaded */ } }
@@ -439,6 +600,7 @@ function engineStop() {
 function afterTransport() { renderTransport(); roomHostSend(true); mediaSessionUpdate(); wakeLockUpdate(); }
 
 async function setMode(mode) {
+  if (mode !== pt.mode) anaEvent('mode', { mode });
   if (room.following) return;
   if (mode === 'mix' && !hasMix()) { toast('There is no Mixdown for this song yet.'); return; }
   if (mode === 'multi' && !pt.tracks.length) { toast('There are no separate tracks for this song yet.'); return; }
@@ -504,7 +666,7 @@ async function ensureTrack(t) {
       t.gain.connect(t.analyser); t.analyser.connect(pt.master);
       applyGains();
       if (pt.playing && engineMode() === 'multi') startSource(t, ctx.currentTime + 0.02, enginePosition() + 0.02);
-    } catch (e) { console.warn('track', t.slug, e); t.failed = String(e.message || e); }
+    } catch (e) { console.warn('track', t.slug, e); t.failed = String(e.message || e); anaEvent('audio_error', { track: t.slug, error: t.failed, offline: !navigator.onLine }); }
     finally { t.loading = null; renderMixerRow(t); renderTransport(); }
   })();
   renderMixerRow(t);
@@ -544,7 +706,7 @@ async function selectSong(slug, opts = {}) {
   if (!opts.fromRoom) roomHostSend(true);
   if (room.following) { renderTransport(); return; }   // followers hold no audio
   let files;
-  try { files = await getFiles(slug); } catch (e) { $('#practice-note').textContent = state.offline || !navigator.onLine ? 'No connection, and this song is not saved on this device yet.' : `Could not load audio: ${e.message}`; return; }
+  try { files = await getFiles(slug); } catch (e) { anaEvent('audio_list_error', { error: String(e.message || e), offline: !navigator.onLine }, slug); $('#practice-note').textContent = state.offline || !navigator.onLine ? 'No connection, and this song is not saved on this device yet.' : `Could not load audio: ${e.message}`; return; }
   if (state.song?.slug !== slug) return;
   const order = state.elements.map((e) => e.slug);
   pt.tracks = Object.keys(files).filter((k) => k !== 'mixdown')
@@ -565,6 +727,7 @@ function neighbour(d) {
   return state.songs[(i + d + state.songs.length) % state.songs.length]?.slug;
 }
 
+pt.audio.addEventListener('error', () => { if (pt.audio.getAttribute('src')) anaEvent('audio_error', { track: 'mixdown', code: pt.audio.error?.code || null, message: pt.audio.error?.message || '' }); });
 pt.audio.addEventListener('ended', () => { renderTransport(); roomHostSend(true); });
 pt.audio.addEventListener('play', () => afterTransport());
 pt.audio.addEventListener('pause', () => afterTransport());
@@ -599,6 +762,7 @@ function renderTransport() {
 }
 
 function tick() {
+  try { anaTick(); } catch (e) { /* analytics never breaks playback */ }
   const s = state.song;
   if (s) {
     const raw = enginePosition();
@@ -867,6 +1031,7 @@ sset('cp-device', room.device);
 const roomCodeGen = () => Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
 
 async function roomOpen(code, host) {
+  anaEvent('room', { action: host ? 'create' : 'join', code });
   await roomLeave(true);
   room.code = code; room.host = host; room.following = !host; room.anchor = null; room.offset = 0; room.bestRtt = Infinity; room.syncMs = null;
   sset('cp-room', { code, host });
@@ -896,6 +1061,7 @@ async function roomOpen(code, host) {
 }
 function enginePauseLocal() { pt.audio.pause(); if (pt.playing) { pt.offset = pt.ctx ? pt.offset + (pt.ctx.currentTime - pt.startAt) : pt.offset; stopSources(); pt.playing = false; } }
 async function roomLeave(silent) {
+  if (room.code) anaEvent('room', { action: 'leave', code: room.code, role: room.host ? 'host' : 'follower', members: room.members, sync_ms: room.syncMs });
   if (!room.channel) { room.code = null; room.following = false; sset('cp-room', null); renderRoomBar(); return; }
   try { if (room.host) await room.channel.send({ type: 'broadcast', event: 'bye', payload: {} }); } catch { /* offline */ }
   try { await db.removeChannel(room.channel); } catch { /* gone */ }
@@ -1028,6 +1194,13 @@ function wireStatic() {
   document.addEventListener('click', () => { $('#acct-menu').hidden = true; });
   $('#acct-out').addEventListener('click', signOut);
   $('#acct-pass').addEventListener('click', passwordDialog);
+  $('#acct-device').addEventListener('click', () => {
+    const name = prompt('Name this device for the usage report (e.g. "Classroom iPad", "Caroline’s phone"):', lget('cp-device-name', ''));
+    if (name == null) return;
+    lset('cp-device-name', name.trim().slice(0, 40));
+    if (ana.session) { const d = deviceInfo(); ana.session.device = d.device; ana.session.info = d.info; anaHeartbeat(); }
+    toast(name.trim() ? `This device is “${name.trim()}”.` : 'Device name cleared.');
+  });
   $('#song-chips').addEventListener('click', (e) => {
     const b = e.target.closest('[data-song]'); if (!b) return;
     if (room.following) roomCmd('song', { slug: b.dataset.song }); else selectSong(b.dataset.song);
@@ -1167,11 +1340,13 @@ function renderSync() {
       <div id="up-table"></div>
     </section>
 
+    <section class="card" id="usage-card"><h2>Usage</h2><p class="muted small">Loading…</p></section>
+
     <section class="card"><h2>Sign-ins</h2><div id="users">Loading…</div>
       <p class="muted small">Caroline signs in with username <b>caroline</b>. She can use the same sign-in on any number of devices, and change her password from the menu at the top right.</p></section>
   </div>`;
   renderUploadTable();
-  renderExportCard(); bridgeWatch();
+  renderExportCard(); bridgeWatch(); renderUsage();
   db.from('cp_users').select('name,role,created_at').order('created_at').then(({ data }) => {
     const u = $('#users'); if (u) u.innerHTML = (data || []).map((m) => `<div>${esc(m.name)} <span class="muted small">· ${esc(m.role)}</span></div>`).join('');
   });
@@ -1256,6 +1431,59 @@ async function saveAls() {
   renderSync();
 }
 
+// ---- usage report (admin): what every device has done, from cp_sessions / cp_plays / cp_events
+const usageSongName = (slug) => state.songs.find((x) => x.slug === slug)?.name || slug;
+const minutes = (m) => (m == null ? '0' : Number(m) >= 60 ? `${Math.floor(m / 60)} h ${Math.round(m % 60)} min` : `${Number(m).toFixed(m < 10 ? 1 : 0)} min`);
+async function renderUsage() {
+  const box = $('#usage-card'); if (!box) return;
+  await aqFlush();
+  const [daily, devices, songs, errors, recent] = await Promise.all([
+    db.from('cp_usage_daily').select('*').order('day', { ascending: false }).limit(21),
+    db.from('cp_usage_devices').select('*').order('last_seen', { ascending: false }),
+    db.from('cp_usage_songs').select('*'),
+    db.from('cp_events').select('at,kind,song_slug,detail,device_id').or('kind.like.%error%,kind.eq.play_blocked').order('at', { ascending: false }).limit(25),
+    db.from('cp_plays').select('started_at,song_slug,mode,room_role,seconds_played,reached_end,seeks,device_id').order('started_at', { ascending: false }).limit(15),
+  ]);
+  if (daily.error) { box.innerHTML = `<h2>Usage</h2><p class="badc small">${esc(daily.error.message)}</p>`; return; }
+  const devName = (id) => (devices.data || []).find((d) => d.device_id === id)?.device || (id || '').slice(0, 8);
+  const tot = (daily.data || []).reduce((a, d) => ({ s: a.s + d.sessions, p: a.p + Number(d.practice_minutes), a: a.a + Number(d.active_minutes) }), { s: 0, p: 0, a: 0 });
+  const when = (t) => new Date(t).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  box.innerHTML = `<div class="row"><h2 style="margin:0">Usage</h2><span class="spacer"></span><button class="btn small" id="usage-refresh">Refresh</button><button class="btn small" id="usage-csv">Download all data (CSV)</button></div>
+    <p class="small">Last 3 weeks: <b>${tot.s}</b> sessions · <b>${minutes(tot.a)}</b> app open · <b>${minutes(tot.p)}</b> of practice playing · ${(devices.data || []).length} device${(devices.data || []).length === 1 ? '' : 's'}</p>
+    <h3>By day</h3><table class="tbl"><thead><tr><th>Day</th><th>Sessions</th><th>Devices</th><th>App open</th><th>Practice</th><th>Plays</th></tr></thead><tbody>
+    ${(daily.data || []).map((d) => `<tr><td>${esc(new Date(d.day + 'T00:00').toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }))}</td><td>${d.sessions}</td><td>${d.devices}</td><td>${minutes(d.active_minutes)}</td><td>${minutes(d.practice_minutes)}</td><td>${d.plays}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Nothing yet.</td></tr>'}</tbody></table>
+    <h3>By song</h3><table class="tbl"><thead><tr><th>Song</th><th>Plays</th><th>To the end</th><th>Practice</th><th>Mixdown / Multitrack / Room</th><th>Devices</th></tr></thead><tbody>
+    ${(songs.data || []).map((x) => `<tr><td><b>${esc(usageSongName(x.song_slug))}</b></td><td>${x.plays}</td><td>${x.played_to_end}</td><td>${minutes(x.practice_minutes)}</td><td class="small">${minutes(x.mixdown_minutes)} / ${minutes(x.multitrack_minutes)} / ${minutes(x.room_minutes)}</td><td>${x.devices}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Nothing yet.</td></tr>'}</tbody></table>
+    <h3>By device</h3><table class="tbl"><thead><tr><th>Device</th><th>Sessions</th><th>App open</th><th>Practice</th><th>Errors</th><th>Last seen</th></tr></thead><tbody>
+    ${(devices.data || []).map((d) => `<tr><td><b>${esc(d.device || '?')}</b><br><span class="muted small">${esc([d.os, d.browser, d.home_screen_app ? 'home-screen app' : ''].filter(Boolean).join(' · '))}</span></td><td>${d.sessions}</td><td>${minutes(d.active_minutes)}</td><td>${minutes(d.practice_minutes)}</td><td class="${d.errors ? 'badc' : ''}">${d.errors}</td><td class="small">${esc(when(d.last_seen))}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Nothing yet.</td></tr>'}</tbody></table>
+    <h3>Latest plays</h3><table class="tbl"><thead><tr><th>When</th><th>Song</th><th>How</th><th>Played</th><th>Device</th></tr></thead><tbody>
+    ${(recent.data || []).map((x) => `<tr><td class="small">${esc(when(x.started_at))}</td><td>${esc(usageSongName(x.song_slug))}${x.reached_end ? ' <span class="ok small">✓ end</span>' : ''}</td><td class="small">${esc(x.mode)}${x.room_role ? ' · room ' + esc(x.room_role) : ''}${x.seeks ? ` · ${x.seeks} seeks` : ''}</td><td>${minutes(Number(x.seconds_played) / 60)}</td><td class="small">${esc(devName(x.device_id))}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">Nothing yet.</td></tr>'}</tbody></table>
+    <h3>Problems</h3>${(errors.data || []).map((e) => `<div class="small" style="margin:4px 0"><span class="badc">${esc(e.kind)}</span> · ${esc(when(e.at))} · ${esc(devName(e.device_id))}${e.song_slug ? ' · ' + esc(usageSongName(e.song_slug)) : ''}<br><span class="muted">${esc(String(e.detail?.message || e.detail?.error || JSON.stringify(e.detail)).slice(0, 220))}</span></div>`).join('') || '<p class="ok small">No errors recorded.</p>'}`;
+  $('#usage-refresh').onclick = renderUsage;
+  $('#usage-csv').onclick = usageCsv;
+}
+async function usageCsv() {
+  const csv = (rows) => {
+    if (!rows.length) return '';
+    const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    const cell = (v) => { const t = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+    return [cols.join(','), ...rows.map((r) => cols.map((c) => cell(r[c])).join(','))].join('\n');
+  };
+  for (const t of ['cp_sessions', 'cp_plays', 'cp_events']) {
+    const all = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await db.from(t).select('*').order(t === 'cp_events' ? 'at' : 'started_at').range(from, from + 999);
+      if (error) { toast(`${t}: ${error.message}`); return; }
+      all.push(...data); if (data.length < 1000) break;
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv(all)], { type: 'text/csv' }));
+    a.download = `caroline-practice-${t.replace('cp_', '')}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
 // ---- export from Ableton (CarolineSync control surface on Aaron's Mac)
 // CarolineSync is a separate Ableton control surface (tools/ableton-remote-script/CarolineSync),
 // never the band's TSPWork. It listens on 127.0.0.1 only and checks the admin's token itself.
@@ -1323,6 +1551,7 @@ async function exportPoll() {
   if (['starting', 'running', 'uploading'].includes(st)) exp.poll = setTimeout(exportPoll, 3000);
   else if (st && exp.job.finished_at && exp.lastFinished !== exp.job.finished_at) {
     exp.lastFinished = exp.job.finished_at;
+    anaEvent('export', { state: exp.job.state, results: (exp.job.results || []).map((r) => ({ song: r.song_id, state: r.state, files: r.files, error: r.error || null, seconds: r.seconds })), uploaded: exp.job.uploaded, upload_failed: exp.job.upload_failed || [] }, null);
     const done = (exp.job.results || []).filter((x) => x.state === 'done').map((x) => x.song_id);
     done.forEach((sl) => exp.selected.delete(sl)); lset('cp-exp-sel', [...exp.selected]);
     await refreshAudioList(); renderSongChips(); pt.filesFor = null;
@@ -1437,6 +1666,7 @@ async function uploadAll() {
     renderUploadTable();
   }
   sync.busy = false;
+  anaEvent('upload', { files: todo.map((r) => ({ song: r.song, track: r.element, state: r.status, note: r.note })) }, null);
   await refreshAudioList(); renderSongChips();
   if (state.song) { pt.filesFor = null; }
   const ok = todo.filter((r) => r.status === 'done').length;

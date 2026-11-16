@@ -49,4 +49,5 @@ create policy cp_meta_read on public.cp_meta for select to authenticated using (
 create policy cp_meta_admin_ins on public.cp_meta for insert to authenticated with check ((select public.cp_is_admin()));
 create policy cp_meta_admin_upd on public.cp_meta for update to authenticated using ((select public.cp_is_admin())) with check ((select public.cp_is_admin()));
 revoke all on public.cp_users, public.cp_songs, public.cp_meta from anon;
--- Users are added by the admin (Aaron) directly; there is no public sign-up.
+-- The live migration also ran: insert into public.cp_users (user_id, name, role) select id, 'Aaron', 'admin' from auth.users where email = 'aaronmark2222@gmail.com';
+-- Other users (Caroline) are added by the admin directly; there is no public sign-up.
